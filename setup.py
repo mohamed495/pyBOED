@@ -23,7 +23,7 @@ setup(
     description="Bayesian Optimal Experimental Design with Model Reduction",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/pyBOED",
+    url="https://github.com/mohamed495/pyBOED",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
