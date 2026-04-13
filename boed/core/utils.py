@@ -21,13 +21,8 @@ from boed.utils.normalization import (
     relative_error,
     zscore_normalize,
 )
-from boed.utils.observation import compute_observation_map, compute_W
+from boed.utils.observation import build_selection_matrices, reduce_system, parse_theta
 from boed.utils.reporting import comparison_table, print_metrics
-from boed.utils.synthetic import (
-    generate_synthetic_observations,
-    generate_synthetic_prior,
-    generate_test_problem,
-)
 from boed.utils.validation import (
     check_dimensions_match,
     validate_covariance,
@@ -38,7 +33,6 @@ from boed.utils.validation import (
 __all__ = [
     "logdet",
     "trace",
-    "compute_observation_map",
     "compute_W",
     "validate_matrix",
     "validate_vector",

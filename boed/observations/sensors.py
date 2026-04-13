@@ -1,9 +1,7 @@
 """Observation operators for spatial and spatio-temporal measurements.
 
 This module defines *observation operators* that map a state (or stacked
-trajectory state) to measurements. This is distinct from
-``boed.inference.ObservationMap``, which operates in observation space for
-selection/compression of an already-defined observation vector.
+trajectory state) to measurements.
 """
 import numpy as np
 from boed.core.base import validate_design_indices
@@ -133,16 +131,14 @@ class SpaceTimeSensors:
             raise ValueError(f"Temporal indices must be in [0, {nt-1}] for nt={nt}.")
         return (self.t_idx * self.nx + self.x_idx).astype(int, copy=False)
 
-    def as_observation_map(self, nt: int):
-        """Return an ``ObservationMap`` for the flattened trajectory vector.
+    def selection_matrix(self, nt: int) -> np.ndarray:
+        """Return a column-selection matrix ``W`` for the flattened trajectory.
 
-        This is useful when a trajectory has already been vectorized and you
-        want to reuse the inference-side ``ObservationMap`` abstraction.
+        ``W`` has shape ``(nx*nt, n_sensors)`` and can be used as
+        ``y_m = W.T @ y`` in inference routines.
         """
-        from boed.inference.observation_map import ObservationMap
-
-        n_obs = self.nx * int(nt)
-        return ObservationMap.from_indices(self.flattened_indices(nt), n_obs=n_obs)
+        flat_idx = self.flattened_indices(nt)
+        return np.eye(self.nx * int(nt))[:, flat_idx]
 
     def observation_operator(self, nt: int) -> np.ndarray:
         """Create an observation operator for extracting measurements.

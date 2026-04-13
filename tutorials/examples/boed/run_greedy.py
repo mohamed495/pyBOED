@@ -1,42 +1,38 @@
-"""Example: Greedy A-optimal experimental design selection.
+"""Example: Greedy EIG design matrix with run_greedy_oed.
 
-This script demonstrates the complete workflow for Bayesian optimal experimental
-design (BOED) using a greedy algorithm with A-optimality criterion.
-
-The example:
-1. Defines an advection-diffusion PDE with unknown parameters
-2. Specifies a Gaussian Process prior over parameters
-3. Selects measurements greedily to minimize posterior parameter variance
-4. Compares against random design and visualizes results
-
-A-optimality minimizes the trace of the posterior covariance, which is equivalent
-to minimizing the average marginal parameter uncertainty.
+This script:
+1. Solves a 1D advection-diffusion trajectory.
+2. Selects space-time sensors with greedy OED using criterion_type="EIG".
+3. Saves a single annotated design matrix figure.
 """
+
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-import numpy.linalg as la
-from boed.priors.kernels import Gaussian, Matern12, Matern32, Matern52
-from boed.priors.gp_priors import GaussianProcessPrior
-from boed.core.noise import NoiseModel
+
 from boed.core import make_u0
-from boed.pde.advection_diffusion import AdvectionDiffusion1D_CN
-from boed.viz.boed_visualizer_pro import BOEDVisualizerPro
-from boed.inference import LinearGaussianModel
-from boed.observations.sensors import SpaceTimeSensors
+from boed.core.noise import NoiseModel
+from boed.design.criteria import DesignCriteria
 from boed.design.greedy import run_greedy_oed
+from boed.observations.sensors import SpaceTimeSensors
+from boed.pde.advection_diffusion import AdvectionDiffusion1D_CN
+from boed.priors.gp_priors import GaussianProcessPrior
+from boed.priors.kernels import Matern32
 
 SEED = 42
 np.random.seed(SEED)
 
-# ===============================================================================
-# 1. CONFIGURATION
-# ===============================================================================
+# ---------------------------------------------------------------------------
+# 1) Setup
+# ---------------------------------------------------------------------------
 N, dt, n_steps = 150, 0.01, 100
 diffusivity, velocity = 0.01, 0.5
-x_grid = np.linspace(0, 1, N)
-n_budget = 8
+n_budget = 5
+max_per_time = 1  # Force temporal spread: at most one sensor per time index.
 
+x_grid = np.linspace(0.0, 1.0, N)
 model = AdvectionDiffusion1D_CN(N, dt, diffusivity=diffusivity, velocity=velocity)
+
 u0 = make_u0(
     x_grid,
     "double_gaussian",
@@ -47,139 +43,119 @@ u0 = make_u0(
 trajectory = model.evolve(u0, n_steps)
 
 kernel = Matern32(length_scale=0.05, sigma=1.0)
-prior_process = GaussianProcessPrior(kernel, nx=N)
-Sigma_prior, mu_prior = prior_process.Sigma, prior_process.mu
+try:
+    prior_process = GaussianProcessPrior(kernel, nx=N, mu=None)
+except TypeError:
+    prior_process = GaussianProcessPrior(kernel, nx=N)
+Sigma_prior = prior_process.Sigma
 noise = NoiseModel(sigma_noise=0.01)
 
-# Candidats
-candidates_x = np.linspace(10, N-10, 25, dtype=int)
+candidates_x = np.linspace(10, N - 10, 25, dtype=int)
 candidates_t = np.linspace(0, n_steps, 15, dtype=int)
 
-# Définition de la QoI pour le critère C (Moyenne sur la zone gauche [0, 0.5])
-L_left = np.zeros(N)
-L_left[N//4:N//2] = 1.0 / (N//2)
+# ---------------------------------------------------------------------------
+# 2) Greedy EIG with run_greedy_oed
+# ---------------------------------------------------------------------------
+print("🔎 Optimisation greedy avec critère EIG (run_greedy_oed)...")
+design_eig, history_eig, Sigma_post = run_greedy_oed(
+    N,
+    model,
+    Sigma_prior,
+    noise,
+    candidates_x,
+    candidates_t,
+    n_budget,
+    "EIG",
+    max_per_time=max_per_time,
+)
 
-# ------------------- 2. Lancement des Optimisations -------------------
-strategies = {}
+final_eig = DesignCriteria.EIG(Sigma_post, Sigma_prior)
+eig_gains = np.diff(np.concatenate(([0.0], np.asarray(history_eig, dtype=float))))
 
-# A. Critère A
-print("🔎 Optimisation A-optimal...")
-des_A, _, _ = run_greedy_oed(N, model, Sigma_prior, noise, candidates_x, candidates_t, n_budget, "A")
-strategies["A-Opt"] = des_A
+print("\nDesign EIG sélectionné (ordre greedy):")
+for k, ((xi, ti), gain, eig_k) in enumerate(zip(design_eig, eig_gains, history_eig), start=1):
+    print(f"  #{k}: x={xi:3d}, t={ti:3d} | ΔEIG={gain:.3f} nats | EIG cumulée={eig_k:.3f} nats")
+print(f"\nEIG finale (KL prior->posterior): {final_eig:.3f} nats")
 
-# B. Critère D
-print("🔎 Optimisation D-optimal...")
-des_D, _, _ = run_greedy_oed(N, model, Sigma_prior, noise, candidates_x, candidates_t, n_budget, "D")
-strategies["D-Opt"] = des_D
+# ---------------------------------------------------------------------------
+# 3) Annotated design matrix output (single panel)
+# ---------------------------------------------------------------------------
+os.makedirs("results/results_eig_design", exist_ok=True)
 
-# C. Critère C (Cible : Zone Gauche)
-print("🔎 Optimisation C-optimal (Zone Gauche)...")
-des_C, _, _ = run_greedy_oed(N, model, Sigma_prior, noise, candidates_x, candidates_t, n_budget, "C", L_qoi=L_left)
-strategies["C-Opt"] = des_C
+unique_pts = sorted(list(set(design_eig)), key=lambda p: p[1])
+sensors = SpaceTimeSensors([p[0] for p in unique_pts], [p[1] for p in unique_pts], N)
 
-# D. Random (Baseline)
-print("🎲 Génération Design Aléatoire...")
-rand_idx = np.random.choice(len(candidates_x) * len(candidates_t), n_budget, replace=False)
-des_rand = []
-for idx in rand_idx:
-    ti_idx = idx // len(candidates_x)
-    xi_idx = idx % len(candidates_x)
-    des_rand.append((candidates_x[xi_idx], candidates_t[ti_idx]))
-strategies["Random"] = des_rand
+fig, ax = plt.subplots(figsize=(11, 6))
 
-# ------------------- 3. Reconstruction & Métriques Unifiées -------------------
-results = {}
+# Force a consistent orientation:
+# - horizontal axis = space x
+# - vertical axis   = time t
+if trajectory.shape == (n_steps + 1, N):
+    traj_img = trajectory
+elif trajectory.shape == (N, n_steps + 1):
+    traj_img = trajectory.T
+else:
+    raise ValueError(
+        f"Unexpected trajectory shape {trajectory.shape}; expected ({n_steps + 1}, {N}) or ({N}, {n_steps + 1})."
+    )
 
-def get_posterior_and_eig(design, strategy_name):
-    # Gestion des doublons
-    unique_pts = sorted(list(set(design)), key=lambda x: x[1])
-    sensors = SpaceTimeSensors([p[0] for p in unique_pts], [p[1] for p in unique_pts], N)
-    W = sensors.observation_operator(n_steps + 1)
-    
-    # Opérateur Forward réduit (u0 -> y)
-    M = model.get_transition_matrix()
-    Traj_Op = np.vstack([np.linalg.matrix_power(M, t) for t in range(n_steps + 1)])
-    A_fwd = W @ Traj_Op
-    
-    # Simulation mesure
-    y_obs = A_fwd @ u0 + np.random.normal(0, noise.sigma, size=len(unique_pts))
-    
-    # Inférence
-    Sigma_eps = (noise.sigma**2) * np.eye(len(unique_pts))
-    lgm = LinearGaussianModel(A_fwd, Sigma_eps, mu_prior, Sigma_prior)
-    mu_post, Sigma_post = lgm.posterior(y_obs)
-    
-    # Calcul EIG (En nats) : 0.5 * (log|Prior| - log|Post|)
-    sign, logdet_prior = la.slogdet(Sigma_prior)
-    sign, logdet_post = la.slogdet(Sigma_post)
-    eig_val = 0.5 * (logdet_prior - logdet_post)
-    
-    # Calcul Erreur QoI (Zone Gauche)
-    err_global = la.norm(u0 - mu_post)
-    qoi_true = L_left @ u0
-    qoi_est = L_left @ mu_post
-    err_qoi = abs(qoi_true - qoi_est)
-    
-    return mu_post, Sigma_post, sensors, eig_val, err_global, err_qoi
+# Use index coordinates to make axis orientation unambiguous.
+x_idx = np.arange(N)
+t_idx = np.arange(n_steps + 1)
+im = ax.pcolormesh(
+    x_idx,
+    t_idx,
+    traj_img,
+    shading="auto",
+    cmap="viridis",
+)
+plt.colorbar(im, ax=ax, label="Amplitude u(x,t)")
 
-print("\n📊 CALCUL DES RÉSULTATS...")
-for name, design in strategies.items():
-    mu, sig, sens, eig, err_g, err_c = get_posterior_and_eig(design, name)
-    results[name] = {
-        "mu": mu, "sig": sig, "sensors": sens, 
-        "eig": eig, "err_global": err_g, "err_qoi": err_c
-    }
-    print(f" > {name}: EIG={eig:.2f} nats | Err Globale={err_g:.3f} | Err QoI={err_c:.4f}")
+# Selected points color-coded by greedy order.
+ax.scatter(
+    sensors.x_idx,
+    np.asarray(sensors.t_idx),
+    c="red",
+    marker="x",
+    s=140,
+    linewidths=2.0,
+    zorder=4,
+    label="Selected sensors",
+)
 
-# ------------------- 4. Visualisation Comparée -------------------
-viz = BOEDVisualizerPro(output_dir="results/results_comparison_final")
+order_map = {pt: k + 1 for k, pt in enumerate(design_eig)}
+for xi, ti in unique_pts:
+    order = order_map[(xi, ti)]
+    gain = eig_gains[order - 1]
+    ax.annotate(
+        f"#{order}\n+{gain:.2f}",
+        (xi, ti),
+        textcoords="offset points",
+        xytext=(7, 7),
+        fontsize=8,
+        color="white",
+        bbox={"boxstyle": "round,pad=0.2", "fc": "black", "alpha": 0.65, "ec": "none"},
+        zorder=5,
+    )
 
-# A. Plot des Designs Spatio-Temporels
-fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-axes = axes.flatten()
-for i, (name, res) in enumerate(results.items()):
-    ax = axes[i]
-    # Utilisation partielle du visualizer ou plot manuel rapide pour la grille
-    im = ax.imshow(trajectory.T, aspect='auto', origin='lower', extent=[0, N, 0, n_steps], cmap="viridis")
-    
-    # Capteurs
-    sx = res["sensors"].x_idx
-    st = res["sensors"].t_idx
-    ax.scatter(sx, st, c='r', marker='x', s=100, linewidth=2)
-    ax.set_title(f"{name} (EIG: {res['eig']:.1f})")
-    ax.set_xlabel("Espace (x)")
-    ax.set_ylabel("Temps (t)")
+ax.set_xlim(0, N - 1)
+ax.set_ylim(0, n_steps)
+ax.set_xlabel(f"Space x (index 0..{N-1})")
+ax.set_ylabel(f"Time t (index 0..{n_steps})")
+ax.set_title(
+    f"EIG design matrix | x-axis = x, y-axis = t | Final EIG = {final_eig:.2f} nats"
+)
+ax.text(0.01, 0.02, "t=0", transform=ax.transAxes, color="white", fontsize=9, va="bottom")
+ax.text(0.01, 0.98, "t increases upward", transform=ax.transAxes, color="white", fontsize=9, va="top")
+ax.legend(frameon=True)
+ax.grid(ls=":", alpha=0.25)
 
+out_pdf = "results/results_eig_design/design_matrix_eig_annotated.pdf"
+out_png = "results/results_eig_design/design_matrix_eig_annotated.png"
 plt.tight_layout()
-plt.savefig("results/results_comparison_final/designs_matrix.pdf")
+plt.savefig(out_pdf)
+plt.savefig(out_png, dpi=180)
+plt.close(fig)
 
-
-
-# B. Plot Reconstruction (Focus A vs C)
-plt.figure(figsize=(12, 6))
-plt.plot(x_grid, u0, 'k-', lw=2, label="Vrai u0")
-plt.plot(x_grid, results["A-Opt"]["mu"], '--', color='tab:blue', label="A-Opt (Global)")
-plt.plot(x_grid, results["C-Opt"]["mu"], '-.', color='tab:green', label="C-Opt (Zone Gauche)")
-plt.plot(x_grid, results["Random"]["mu"], ':', color='gray', alpha=0.6, label="Random")
-
-# Zone QoI
-plt.axvspan(0, 0.5, color='green', alpha=0.1, label="Zone d'intérêt (QoI)")
-plt.legend()
-plt.title("Reconstruction : A-Optimality vs C-Optimality")
-plt.savefig("results/results_comparison_final/reconstruction_comparison.pdf")
-
-# C. Analyse Spectrale (Incertitude)
-plt.figure(figsize=(10, 5))
-for name, res in results.items():
-    if name == "Random": continue # On allège le graph
-    eigenvals = np.linalg.eigvalsh(res["sig"])
-    plt.semilogy(np.sort(eigenvals)[::-1], label=f"{name}")
-
-plt.semilogy(np.sort(np.linalg.eigvalsh(Sigma_prior))[::-1], 'k--', label="Prior", alpha=0.5)
-plt.ylabel("Variance (Valeurs Propres)")
-plt.xlabel("Modes")
-plt.title("Réduction de l'Incertitude par Stratégie")
-plt.legend()
-plt.savefig("results/results_comparison_final/spectral_analysis.pdf")
-
-print("\n✅ Analyse terminée. Ouvrez 'results/results_comparison_final/designs_matrix.pdf' pour voir les différences.")
+print(f"\n✅ Figure sauvegardée: {out_pdf}")
+print(f"✅ Figure sauvegardée: {out_png}")

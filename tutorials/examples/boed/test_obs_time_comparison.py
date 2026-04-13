@@ -60,7 +60,6 @@ for T_obs in obs_times:
 
     nl_model = NonlinearLaplaceModel(
         pde_model=model,
-        H=np.eye(N),
         Sigma_obs=noise.get_covariance(N),
         mu_prior=prior.mu,
         Sigma_prior=prior.Sigma,
@@ -81,8 +80,8 @@ for T_obs in obs_times:
     G = model.get_forward_operator(n_steps=T_obs, u0_ref=theta_MAP)
     A = np.eye(N) @ G   # H = I_N
     lin_model = LinearGaussianModel(
-        A=A,
-        Sigma_noise=noise.get_covariance(N),
+        model=A,
+        Sigma_obs=noise.get_covariance(N),
         mu_prior=prior.mu,
         Sigma_prior=prior.Sigma,
     )

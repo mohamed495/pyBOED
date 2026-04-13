@@ -5,9 +5,8 @@ implementation split across focused submodules (linear algebra, validation,
 I/O, reporting, etc.).
 """
 from .linalg import logdet, trace
-from .observation import compute_observation_map, compute_W
+from .observation import build_selection_matrices, reduce_system, parse_theta
 from .validation import validate_matrix, validate_vector, validate_covariance, check_dimensions_match
-from .synthetic import generate_synthetic_prior, generate_synthetic_observations, generate_test_problem
 from .io import load_experiment, save_experiment
 from .logging_utils import Logger
 from .normalization import (
@@ -25,15 +24,11 @@ from .config import load_config, merge_configs, save_config
 __all__ = [
     "logdet",
     "trace",
-    "compute_observation_map",
     "compute_W",
     "validate_matrix",
     "validate_vector",
     "validate_covariance",
     "check_dimensions_match",
-    "generate_synthetic_prior",
-    "generate_synthetic_observations",
-    "generate_test_problem",
     "save_experiment",
     "load_experiment",
     "Logger",
@@ -49,4 +44,7 @@ __all__ = [
     "save_config",
     "load_config",
     "merge_configs",
+    "build_selection_matrices", 
+    "reduce_system", 
+    "parse_theta",
 ]

@@ -222,14 +222,18 @@ def run_greedy_oed(*args, **kwargs):
         Temporal indices of candidate measurement times
     n_budget : int
         Number of measurements to select (budget)
-    criterion_type : {'A', 'D', 'C'}, default='A'
+    criterion_type : {'A', 'D', 'C', 'EIG'}, default='A'
         Design optimality criterion:
         - 'A': A-optimality (minimize trace of posterior covariance)
         - 'D': D-optimality (minimize log-determinant of posterior covariance)
         - 'C': C-optimality (minimize variance of linear functional)
+        - 'EIG': maximize expected information gain
     L_qoi : np.ndarray, optional
         Observation matrix for quantity of interest (QoI).
         Required if criterion_type='C', shape (m, N) where m is number of QoIs
+    max_per_time : int, optional
+        Maximum number of selected sensors per time index.
+        If None, no per-time limit is applied.
         
     Returns
     -------
@@ -309,6 +313,7 @@ def run_greedy_oed(*args, **kwargs):
         "criterion_type",
         "L_qoi",
         "verbose",
+        "max_per_time",
     ]
     legacy_order = [
         "N",
@@ -321,6 +326,7 @@ def run_greedy_oed(*args, **kwargs):
         "criterion_type",
         "L_qoi",
         "verbose",
+        "max_per_time",
     ]
 
     legacy_mode = ("N" in kwargs) or ("prior_kernel" in kwargs)
@@ -359,6 +365,7 @@ def run_greedy_oed(*args, **kwargs):
     criterion_type = values.get("criterion_type", "A")
     L_qoi = values.get("L_qoi", None)
     verbose = values.get("verbose", True)
+    max_per_time = values.get("max_per_time", None)
     N_legacy = values.get("N", None)
 
     missing = [
@@ -383,7 +390,15 @@ def run_greedy_oed(*args, **kwargs):
 
     current_Sigma = Sigma_prior.copy()
     selected_design = []
+    selected_set = set()
     history = []
+    criterion = str(criterion_type).upper()
+    eig_cum = 0.0
+    time_counts = {}
+    if max_per_time is not None:
+        max_per_time = int(max_per_time)
+        if max_per_time <= 0:
+            raise ValueError("max_per_time must be >= 1 when provided.")
 
     # Precompute trajectory operator
     M = model.get_transition_matrix()
@@ -391,52 +406,74 @@ def run_greedy_oed(*args, **kwargs):
     Trajectory_Op = np.vstack([np.linalg.matrix_power(M, t) for t in range(max_t + 1)])
     
     sigma2 = getattr(noise_model, 'sigma', 0.01)**2
+    if criterion == "EIG" and sigma2 <= 0.0:
+        raise ValueError("Noise variance must be > 0 for criterion 'EIG'.")
 
     if verbose:
-        print(f"--- Greedy OED optimization (criterion {criterion_type}) ---")
+        print(f"--- Greedy OED optimization (criterion {criterion}) ---")
 
     for k in range(n_budget):
         best_score = np.inf
         best_cand = None
         best_Sigma_step = None
+        best_eig_gain = None
         
         for ti in candidates_t:
             for xi in candidates_x:
-                if (xi, ti) in selected_design: 
+                if (xi, ti) in selected_set:
+                    continue
+                if max_per_time is not None and time_counts.get(int(ti), 0) >= max_per_time:
                     continue
                 
                 # Sherman-Morrison update for Sigma
                 g = Trajectory_Op[ti * N + xi, :].reshape(1, -1)
-                S = (g @ current_Sigma @ g.T).item() + sigma2
+                signal_var = (g @ current_Sigma @ g.T).item()
+                S = signal_var + sigma2
                 diff = (current_Sigma @ g.T) @ (g @ current_Sigma) / S
                 Sigma_temp = current_Sigma - diff
                 
                 # Score computation
-                if criterion_type == "A":
+                if criterion == "A":
                     score = DesignCriteria.A_opt(Sigma_temp)
-                elif criterion_type == "D":
+                elif criterion == "D":
                     score = DesignCriteria.D_opt(Sigma_temp)
-                elif criterion_type == "C":
+                elif criterion == "C":
                     if L_qoi is None: 
                         raise ValueError("L_qoi is required for criterion C")
                     score = DesignCriteria.C_opt(Sigma_temp, L_qoi)
+                elif criterion == "EIG":
+                    # Exact rank-1 EIG increment for scalar linear observation:
+                    # Delta EIG = 0.5 * log(1 + g Sigma g^T / sigma^2)
+                    eig_gain = 0.5 * np.log1p(signal_var / sigma2)
+                    # Greedy minimizes score -> maximize cumulative EIG.
+                    score = -(eig_cum + eig_gain)
                 else:
                     raise ValueError(f"Unknown criterion type: {criterion_type}")
                 
                 if score < best_score:
                     best_score, best_cand, best_Sigma_step = score, (xi, ti), Sigma_temp
+                    if criterion == "EIG":
+                        best_eig_gain = eig_gain
 
         if best_cand is None: 
             break
 
         current_Sigma = best_Sigma_step
         selected_design.append(best_cand)
-        history.append(best_score)
+        selected_set.add(best_cand)
+        t_sel = int(best_cand[1])
+        time_counts[t_sel] = time_counts.get(t_sel, 0) + 1
+        if criterion == "EIG":
+            # Keep history as cumulative EIG in nats.
+            eig_cum += float(best_eig_gain if best_eig_gain is not None else 0.0)
+            history.append(eig_cum)
+        else:
+            history.append(best_score)
         
         if verbose:
             print(
                 f"Step {k+1}/{n_budget}: x={best_cand[0]}, "
-                f"t={best_cand[1]} | Score: {best_score:.4e}"
+                f"t={best_cand[1]} | Score: {history[-1]:.4e}"
             )
 
     return selected_design, history, current_Sigma

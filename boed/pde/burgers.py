@@ -7,18 +7,19 @@ import numpy as np
 import numpy.linalg as la
 
 # ==============================================================================
-# 2. NONLINEAR BURGERS MODEL (Semi-Implicit Crank-Nicolson)
+# 2. BURGERS MODEL (Semi-Implicit Crank-Nicolson)
 # ==============================================================================
 
-class BurgersNonLinear_CN:
+class Burgers_CN:
     """
     1D Burgers model: ∂u/∂t + u ∂u/∂x = ν ∂²u/∂x²
     Semi-implicit scheme (Crank-Nicolson for diffusion, explicit for advection).
     """
-    def __init__(self, N, dt, diffusivity=0.01):
+    def __init__(self, N, dt, diffusivity=0.01, lambda_=1.):
         self.N = N
         self.dt = dt
         self.nu = diffusivity
+        self.lambda_ = lambda_
         self.dx = 1.0 / (N + 1)
         
         # Spatial operators
@@ -40,7 +41,7 @@ class BurgersNonLinear_CN:
         for n in range(n_steps):
             u_n = U[n]
             # Nonlinear advective term: u * ∂u/∂x
-            advection = u_n * (self.D1 @ u_n)
+            advection = self.lambda_ *u_n * (self.D1 @ u_n)
             U[n+1] = self.B_inv @ (self.C_diff @ u_n - self.dt * advection)
         return U
 
@@ -57,7 +58,7 @@ class BurgersNonLinear_CN:
         M_adv = np.diag(self.D1 @ u_ref) + np.diag(u_ref) @ self.D1
         
         # Linearized transition matrix
-        M_lin = self.B_inv @ (self.C_diff - self.dt * M_adv)
+        M_lin = self.B_inv @ (self.C_diff - self.dt * self.lambda_ * M_adv)
         return M_lin
 
     def get_forward_operator(self, n_steps, u0_ref=None):

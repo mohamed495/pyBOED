@@ -64,8 +64,6 @@ class DesignCriteria:
     @staticmethod
     def _projection_from_observation_input(
         n_obs: int,
-        *,
-        obs_map=None,
         W: np.ndarray | None = None,
     ) -> np.ndarray:
         """Normalize observation selection/compression input to a projection matrix.
@@ -74,64 +72,41 @@ class DesignCriteria:
         ----------
         n_obs : int
             Full observation dimension.
-        obs_map : optional
-            New unified observation mapping input. Accepted formats:
-            - ObservationMap-like object exposing ``as_projection()``
+        W : np.ndarray, optional
+            Compression input. Accepted formats:
             - 1D array of indices
             - 2D binary diagonal mask
             - 2D projection matrix
-        W : np.ndarray, optional
-            Legacy compression matrix argument (kept for backward compatibility).
 
         Returns
         -------
         np.ndarray
             Projection matrix ``U`` of shape ``(n_obs, m)``.
         """
-        if obs_map is not None and W is not None:
-            raise ValueError("Provide either 'obs_map' or legacy 'W', not both.")
-
-        if obs_map is None and W is None:
+        if W is None:
             return np.eye(n_obs)
 
-        if obs_map is None:
-            U = np.asarray(W, dtype=float)
-            if U.ndim != 2:
-                raise ValueError("Legacy 'W' compression argument must be a 2D matrix.")
-            if U.shape[0] != n_obs:
-                raise ValueError(
-                    "Legacy 'W' compression matrix row dimension must match "
-                    f"the observation dimension ({U.shape[0]} != {n_obs})."
-                )
-            if U.shape[1] == 0:
-                raise ValueError("Compression matrix must have at least one column.")
-            return U
-
-        if hasattr(obs_map, "as_projection"):
-            U = np.asarray(obs_map.as_projection(), dtype=float)
-        else:
-            arr = np.asarray(obs_map)
-            if arr.ndim == 1:
-                idx = arr.astype(int, copy=False)
-                if np.any(idx < 0) or np.any(idx >= n_obs):
-                    raise ValueError(f"Sensor indices must be in [0, {n_obs - 1}].")
-                if np.unique(idx).size != idx.size:
-                    raise ValueError("Sensor indices must be unique.")
+        arr = np.asarray(W)
+        if arr.ndim == 1:
+            idx = arr.astype(int, copy=False)
+            if np.any(idx < 0) or np.any(idx >= n_obs):
+                raise ValueError(f"Sensor indices must be in [0, {n_obs - 1}].")
+            if np.unique(idx).size != idx.size:
+                raise ValueError("Sensor indices must be unique.")
+            U = np.eye(n_obs)[:, idx]
+        elif arr.ndim == 2:
+            mat = np.asarray(arr, dtype=float)
+            if DesignCriteria._is_binary_diagonal_mask(mat):
+                idx = np.flatnonzero(np.diag(mat) > 0.5)
+                if idx.size == 0:
+                    raise ValueError("Mask must activate at least one observation.")
                 U = np.eye(n_obs)[:, idx]
-            elif arr.ndim == 2:
-                mat = np.asarray(arr, dtype=float)
-                if DesignCriteria._is_binary_diagonal_mask(mat):
-                    idx = np.flatnonzero(np.diag(mat) > 0.5)
-                    if idx.size == 0:
-                        raise ValueError("Mask must activate at least one observation.")
-                    U = np.eye(n_obs)[:, idx]
-                else:
-                    U = mat
             else:
-                raise TypeError(
-                    "obs_map must be an ObservationMap-like object, a 1D index array, "
-                    "a 2D binary diagonal mask, or a 2D projection matrix."
-                )
+                U = mat
+        else:
+            raise TypeError(
+                "W must be a 1D index array, a 2D binary diagonal mask, or a 2D projection matrix."
+            )
 
         if U.ndim != 2:
             raise ValueError("Projection matrix must be 2D.")
@@ -307,8 +282,6 @@ class DesignCriteria:
     def eig_from_observation_cov(
         Sigma_y: np.ndarray,
         Sigma_noise: np.ndarray,
-        *,
-        obs_map=None,
         W: np.ndarray | None = None,
     ) -> float:
         """Analytical EIG in the linear-Gaussian case via observation covariances.
@@ -319,11 +292,9 @@ class DesignCriteria:
             Marginal observation covariance ``Sigma_y = Sigma_noise + A Sigma_prior A.T``.
         Sigma_noise : np.ndarray
             Observation noise covariance.
-        obs_map : optional
-            Unified observation map (preferred): indices, mask, projection, or
-            an object exposing ``as_projection()``.
         W : np.ndarray, optional
-            Legacy compression matrix argument (kept for backward compatibility).
+            Compression input. Accepted formats: index array, binary diagonal mask,
+            or projection matrix. ``None`` means identity.
         """
         Sigma_y = np.asarray(Sigma_y, dtype=float)
         Sigma_noise = np.asarray(Sigma_noise, dtype=float)
@@ -334,7 +305,6 @@ class DesignCriteria:
 
         U = DesignCriteria._projection_from_observation_input(
             Sigma_y.shape[0],
-            obs_map=obs_map,
             W=W,
         )
         return DesignCriteria._eig_from_observation_cov_core(Sigma_y, Sigma_noise, U)
@@ -349,8 +319,7 @@ class DesignCriteria:
 
         Notes
         -----
-        ``W`` is a legacy name for a compression matrix (projection/selection).
-        Prefer ``eig_from_observation_cov(..., obs_map=...)``.
+        This forwards to :meth:`eig_from_observation_cov`.
         """
         return DesignCriteria.eig_from_observation_cov(
             Sigma_y,

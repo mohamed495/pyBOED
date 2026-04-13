@@ -62,7 +62,7 @@ class GaussianProcessPrior:
     >>> print(prior.x.shape)       # (200,)
     """
     
-    def __init__(self, kernel, nx: int, domain=(0, 1), jitter=1e-10):
+    def __init__(self, kernel, nx: int, mu : np.ndarray | None, domain=(0, 1), jitter=1e-10):
         """Initialize Gaussian Process prior.
         
         Parameters
@@ -83,7 +83,7 @@ class GaussianProcessPrior:
 
         self.x = np.linspace(domain[0], domain[1], nx)
         self.Sigma = self._build_covariance()
-        self.mu = np.zeros(nx)
+        self.mu = mu if mu is not None else np.zeros(nx)
         self.Sigma_inv = np.linalg.inv(self.Sigma)
 
     def _build_covariance(self) -> np.ndarray:

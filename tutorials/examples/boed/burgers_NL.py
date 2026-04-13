@@ -133,8 +133,8 @@ Sigma_noise = noise.get_covariance(N)
 
 # 4. Inférence avec les matrices recalibrées
 lgm = LinearGaussianModel(
-    A=model.get_forward_operator(n_steps=n_steps,u0_ref=u_true), 
-    Sigma_noise=Sigma_noise, 
+    model=model.get_forward_operator(n_steps=n_steps, u0_ref=u_true),
+    Sigma_obs=Sigma_noise,
     mu_prior=prior.mu, 
     Sigma_prior=prior.Sigma
 )

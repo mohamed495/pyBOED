@@ -2,7 +2,7 @@
 Minimal test suite for boed package.
 Tests basic functionality and imports.
 """
-import pytest
+import pytest # pyright: ignore[reportMissingImports]
 import numpy as np
 from boed.core.utils import logdet, trace, validate_matrix
 

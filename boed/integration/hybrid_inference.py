@@ -92,8 +92,8 @@ class HybridBayesianInference:
         
         # Store full model
         self.lgm = LinearGaussianModel(
-            A=forward_operator,
-            Sigma_noise=noise_covariance,
+            model=forward_operator,
+            Sigma_obs=noise_covariance,
             mu_prior=prior_mean,
             Sigma_prior=prior_covariance
         )
@@ -106,7 +106,7 @@ class HybridBayesianInference:
         self.n_params = len(prior_mean)
         self.n_obs = len(noise_covariance)
         self._log_likelihood_normalization = 0.5 * (
-            float(np.linalg.slogdet(self.lgm.Sigma_noise)[1])
+            float(np.linalg.slogdet(self.lgm.Sigma_obs)[1])
             + self.n_obs * np.log(2 * np.pi)
         )
         
@@ -201,8 +201,8 @@ class HybridBayesianInference:
         return observations - (self.lgm.A @ parameter)
 
     def _solve_noise_system(self, rhs: np.ndarray) -> np.ndarray:
-        """Solve ``Sigma_noise x = rhs`` using the linear-Gaussian model noise covariance."""
-        return np.linalg.solve(self.lgm.Sigma_noise, rhs)
+        """Solve ``Sigma_obs x = rhs`` using the linear-Gaussian model noise covariance."""
+        return np.linalg.solve(self.lgm.Sigma_obs, rhs)
 
     def _log_likelihood(
         self,

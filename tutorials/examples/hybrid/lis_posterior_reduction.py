@@ -96,8 +96,8 @@ def main():
     
     # Create linear Gaussian model
     lgm = LinearGaussianModel(
-        A=H,
-        Sigma_noise=R,
+        model=H,
+        Sigma_obs=R,
         mu_prior=mu_prior,
         Sigma_prior=Sigma_prior
     )

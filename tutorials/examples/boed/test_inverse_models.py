@@ -76,7 +76,6 @@
 
 # nl_model = NonlinearLaplaceModel(
 #     pde_model=model,
-#     H=np.eye(N=N),
 #     Sigma_obs=noise.get_covariance(N),
 #     mu_prior=prior.mu,
 #     Sigma_prior=prior.Sigma
@@ -195,7 +194,7 @@ from boed.priors.kernels import Gaussian
 from boed.priors.gp_priors import GaussianProcessPrior
 from boed.core.noise import NoiseModel
 from boed.core import make_u0
-from boed.pde.burgers import BurgersNonLinear_CN
+from boed.pde.burgers import Burgers_CN
 from boed.inference import LinearGaussianModel, NonlinearLaplaceModel
 
 # ---------------------------------------------------------------------------
@@ -212,7 +211,7 @@ sigma = 0.05
 x_grid = np.linspace(0, 1, N + 2)[1:-1]
 
 # PDE model
-model = BurgersNonLinear_CN(N=N, dt=dt, diffusivity=0.02)
+model = Burgers_CN(N=N, dt=dt, diffusivity=0.02)
 
 # True initial condition
 u0_true = make_u0(x_grid, "gaussian", center=0.25, width=0.07, amplitude=1.5)
@@ -233,12 +232,11 @@ kernel = Gaussian(length_scale=0.1, sigma=1.0)
 prior  = GaussianProcessPrior(kernel, nx=N)
 
 # ---------------------------------------------------------------------------
-# NonlinearLaplaceModel — obs at t=T, H = I_N
+# NonlinearLaplaceModel — obs at t=T
 # ---------------------------------------------------------------------------
 
 nl_model = NonlinearLaplaceModel(
     pde_model=model,
-    H=np.eye(N),                    # observe full state
     Sigma_obs=noise.get_covariance(N),
     mu_prior=prior.mu,
     Sigma_prior=prior.Sigma,
