@@ -13,3 +13,4 @@ venv/
 *.jpeg
 *.pdf
 *.npy
+*.gz
