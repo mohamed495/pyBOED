@@ -109,6 +109,22 @@ class LinearGaussianModel(InverseModel):
         if sign_num <= 0 or sign_den <= 0:
             raise ValueError("Compressed covariances must be positive definite.")
         return float(0.5 * (logdet_num - logdet_den))
+    
+    def eig_post(self,
+        Sigma_post: np.ndarray,
+        Sigma_prior: np.ndarray,
+    ) -> float:
+        """Expected information gain from parameter covariances.
+
+        Formula
+        -------
+        ``EIG = 0.5 * (log|Sigma_prior| - log|Sigma_post|)``
+        """
+        _, logdet_prior = la.slogdet(Sigma_prior)
+        _, logdet_post = la.slogdet(Sigma_post)
+
+        eig = 0.5 * (logdet_prior - logdet_post)
+        return float(max(0.0, eig))
 
     def expected_information_gain(
         self,
