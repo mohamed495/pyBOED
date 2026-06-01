@@ -8,6 +8,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/pyboed_mpl")
 
 import numpy as np
 import numpy.linalg as la
+from scipy import linalg as sla
 from joblib import Parallel, delayed # type: ignore
 from scipy.stats import norm, qmc
 
@@ -37,12 +38,12 @@ from boed.utils.observation import build_selection_matrices
 
 LAMBDAS        = [0.0, 0.25, 0.5, 1.0]
 SENSOR_BUDGETS = [5, 10, 15, 20, 25]
-N_REPEATS      = 5
+N_REPEATS      = 1
 BASE_SEED      = 42
 N_JOBS         = -1
 
 # Modèle
-N           = 100
+N           = 200
 DT          = 0.001
 N_STEPS     = 100
 SIGMA       = 0.1
@@ -59,12 +60,12 @@ U0_AMPLITUDE    = 1.5
 N_SAMPLES             = 500    # l_theta, H_theta, Sigma_signal répétés
 N_SAMPLES_SIGMA_Y     = 500    # Sigma_Y répétés
 N_SAMPLES_SIGMA_Y_REF = 1500  # Sigma_Y_ref (une fois)
-N_SAMPLES_EIG         = 150000  # eig_mem NMC
+N_SAMPLES_EIG         = 500  # eig
 
 # NN
 N_TRAIN  = 100000
 N_TEST   = 2000
-N_EPOCHS = 100
+N_EPOCHS = 30
 HIDDEN   = [64, 64]
 
 OUTPUT_DIR = Path("results_sweep")
@@ -144,6 +145,38 @@ def compute_Sigma_signal(l_theta, H_theta, Sigma_theta, Sigma_obs):
     X = la.solve(A, l_theta)
     return np.asarray(Sigma_obs) + l_theta.T @ X
 
+def compute_Sigma_signal_misfit(l_theta, H_theta, Sigma_theta, Sigma_obs):
+
+    # Symmetric square root of Sigma_theta
+    eigvals, eigvects = np.linalg.eigh(Sigma_theta)
+
+    # Numerical safeguard
+    eigvals = np.clip(eigvals, 0.0, None)
+
+    Sigma_theta_sqrt = (
+        eigvects
+        @ np.diag(np.sqrt(eigvals))
+        @ eigvects.T
+    )
+
+    H_misfit = (
+        Sigma_theta_sqrt
+        @ H_theta
+        @ Sigma_theta_sqrt
+    )
+
+    I_plus_H_misfit = np.eye(H_misfit.shape[0]) + H_misfit
+
+    A = (
+        Sigma_theta_sqrt
+        @ la.solve(I_plus_H_misfit, Sigma_theta_sqrt)
+    )
+
+    X = la.solve(A, l_theta)
+
+    return Sigma_obs + l_theta.T @ X
+
+
 
 # =============================================================================
 # Estimation EIG
@@ -157,38 +190,107 @@ def eig_linearise(G, prior, Sigma_obs):
     _, ld_obs = la.slogdet(np.asarray(Sigma_obs))
     return 0.5 * (ld_S - ld_obs)
 
+# ----------------------------------------------------------------------
+# 1.  Prior via KL expansion
+# ----------------------------------------------------------------------
+class KLPrior:
+    """
+    Prior = N(mu, Sigma) → représentation KL tronquée.
+    theta = mu + V_k @ diag(sqrt(lam_k)) @ xi,   xi ~ N(0, I_k)
+    """
+    def __init__(self, mu, Sigma, energy=0.9999):
+        self.mu_full = np.asarray(mu)
+        ev, V = np.linalg.eigh(np.asarray(Sigma))
+        ev    = ev[::-1];  V = V[:, ::-1]          # décroissant
+        cumvar = np.cumsum(ev) / ev.sum()
+        self.k = int(np.searchsorted(cumvar, energy)) + 1
+        self.V_k      = V[:, :self.k]              # (d, k)
+        self.lam_k    = ev[:self.k]                # (k,)
+        self.sqrt_lam = np.sqrt(self.lam_k)        # (k,)
+        # prior dans l'espace réduit : N(0, I_k)
+        self.mu    = np.zeros(self.k)
+        self.Sigma = np.eye(self.k)
+        self.L     = np.eye(self.k)
+        self.Sinv  = np.eye(self.k)
+        captured = cumvar[self.k-1] * 100
+        print(f"KL tronquée : {self.k} modes, {captured:.3f}% variance")
 
-def _logsumexp_rows(A):
-    amax = A.max(axis=1, keepdims=True)
-    return amax.squeeze() + np.log(np.exp(A - amax).sum(axis=1))
+    def xi_to_theta(self, xi):
+        """xi (k,) → theta (d,)"""
+        return self.mu_full + self.V_k @ (self.sqrt_lam * xi)
+
+    def make_G_reduced(self, G):
+        """G_r(xi) = G( xi_to_theta(xi) )"""
+        return lambda xi: G(self.xi_to_theta(xi))
+
+    def make_J_reduced(self, J_G):
+        """J_r(xi) = J_G( theta ) @ V_k @ diag(sqrt_lam)"""
+        def J_reduced(xi):
+            theta = self.xi_to_theta(xi)
+            J = np.asarray(J_G(theta))          # (m, d)
+            return J @ self.V_k @ np.diag(self.sqrt_lam)   # (m, k)
+        return J_reduced
 
 
-def estimate_eig_nmc(G, prior, Sigma_obs, n_samples, batch_size=500, seed=None):
-    """Estimateur NMC mémoire-efficace de l'EIG."""
-    thetas = sample_prior(prior, n_samples, seed=seed)
-    U = np.asarray(Parallel(n_jobs=N_JOBS)(delayed(G)(th) for th in thetas))
-    m     = U.shape[1]
-    Sinv  = la.inv(Sigma_obs)
-    _, ld = la.slogdet(Sigma_obs)
-    log_c = -0.5 * (ld + m * np.log(2 * np.pi))
+# ----------------------------------------------------------------------
+# 2.  Estimateur principal : KL + marginale analytique + correction
+# ----------------------------------------------------------------------
+def estimate_eig_kl(G, J_G, kl_prior, Sigma_obs, n_outer, seed=None, n_jobs=-1):
+    """
+    Estimateur sans biais (à la linéarisation près) pour l'EIG.
+    Fonctionne pour G linéaire ou faiblement non‑linéaire.
+    """
+    G_r   = kl_prior.make_G_reduced(G)
+    J_r   = kl_prior.make_J_reduced(J_G)
+    k     = kl_prior.k
+    m     = len(Sigma_obs)
 
-    rng = np.random.default_rng(seed)
-    Y   = U + rng.multivariate_normal(np.zeros(m), Sigma_obs, size=n_samples)
-    YM, UM = Y @ Sinv, U @ Sinv
-    nY = np.einsum("ij,ij->i", Y, YM)
-    nU = np.einsum("ij,ij->i", U, UM)
+    # pré‑calculs pour Sigma_obs
+    L_obs    = sla.cholesky(Sigma_obs, lower=True)
+    Sinv_obs = sla.cho_solve((L_obs, True), np.eye(m))
+    _, ld    = la.slogdet(Sigma_obs)
+    log_c    = -0.5 * (ld + m * np.log(2 * np.pi))
 
-    eig = 0.0
-    for i in range(0, n_samples, batch_size):
-        ie    = min(i + batch_size, n_samples)
-        bs    = ie - i
-        cross = YM[i:ie] @ U.T
-        quad  = nY[i:ie, None] + nU[None, :] - 2 * cross
-        ll    = log_c - 0.5 * quad
-        ln    = ll[np.arange(bs), i + np.arange(bs)]
-        ld_   = _logsumexp_rows(ll) - np.log(n_samples)
-        eig  += (ln - ld_).sum()
-    return float(eig / n_samples)
+    # seeds reproductibles
+    ss    = np.random.SeedSequence(seed)
+    seeds = ss.spawn(n_outer)
+
+    def _step(seed_i):
+        rng = np.random.default_rng(seed_i)
+
+        # 1. xi ~ N(0, I_k)
+        xi = rng.standard_normal(k)
+        Gr = np.asarray(G_r(xi))
+        Jr = np.asarray(J_r(xi))
+
+        # 2. Matrice marginale S = Jr Jr^T + Sigma_obs
+        S      = Jr @ Jr.T + Sigma_obs
+        L_S    = sla.cholesky(S, lower=True)
+        Sinv_S = sla.cho_solve((L_S, True), np.eye(m))
+        _, ld_S = la.slogdet(S)
+        log_c_S = -0.5 * (ld_S + m * np.log(2 * np.pi))
+
+        # 3. Correction du biais quadratique
+        #    = ½ tr( (S^{-1} - Σ_obs^{-1}) Σ_obs )
+        bias_corr = 0.5 * (np.trace(Sinv_S @ Sigma_obs) - m)
+
+        # 4. Simuler y
+        eps = rng.multivariate_normal(np.zeros(m), Sigma_obs)
+        y   = Gr + eps
+
+        # 5. log p(y | xi)
+        log_lik = log_c - 0.5 * np.dot(eps, Sinv_obs @ eps)
+
+        # 6. log p(y) par marginale analytique
+        r = y - Gr
+        log_py = log_c_S - 0.5 * r @ Sinv_S @ r
+
+        return float(log_lik - log_py - bias_corr)
+
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_step)(seeds[i]) for i in range(n_outer)
+    )
+    return float(np.mean(results))
 
 
 # =============================================================================
@@ -336,81 +438,136 @@ def eig_BS(Sigma_signal, Sigma_obs, W):
     return _log_ratio(Sigma_signal, Sigma_obs, W) - _log_ratio(Sigma_signal, Sigma_obs, eye)
 
 
+
+def greedy_maximize_LB(Sigma_Y, Sigma_noise, n_sensors):
+    """
+    Greedy forward sensor selection maximizing
+    0.5 * log det(Sigma_Y) - 0.5 * log det(Sigma_noise)
+    """
+
+    Sigma_Y = 0.5 * (Sigma_Y + Sigma_Y.T)
+    Sigma_noise = 0.5 * (Sigma_noise + Sigma_noise.T)
+
+    N = Sigma_Y.shape[0]
+
+    selected = []
+    remaining = set(range(N))
+
+    def logdet_spd(A):
+        L = np.linalg.cholesky(A)
+        return 2.0 * np.sum(np.log(np.diag(L)))
+
+    for _ in range(n_sensors):
+
+        best_idx = None
+        best_score = -np.inf
+
+        for idx in remaining:
+
+            S = selected + [idx]
+            ix = np.ix_(S, S)
+
+            logdet_y = logdet_spd(Sigma_Y[ix])
+            logdet_n = logdet_spd(Sigma_noise[ix])
+
+            score = 0.5 * (logdet_y - logdet_n)
+
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        selected.append(best_idx)
+        remaining.remove(best_idx)
+
+    return np.array(selected, dtype=int)
+
+
 def schur(Sigma, Wm):
     if Wm.size == 0:
         return Sigma
-    G_mat = Wm.T @ Sigma @ Wm
-    return Sigma - Sigma @ Wm @ la.inv(G_mat) @ Wm.T @ Sigma
+
+    G = Wm.T @ Sigma @ Wm
+    correction = Sigma @ Wm @ np.linalg.solve(G, Wm.T @ Sigma)
+
+    return Sigma - correction
 
 
-def greedy_maximize_LB(Sigma_Y, Sigma_noise, n_sensors):
-    """Sélection greedy forward maximisant la borne conservative BI."""
-    N_grid    = Sigma_Y.shape[0]
-    selected  = []
-    remaining = list(range(N_grid))
-    for _ in range(n_sensors):
-        best_idx, best_score = None, -np.inf
+def incremental_bounds(
+    Sigma_signal:  np.ndarray,
+    Sigma_Y_theta: np.ndarray,
+    Sigma_Y:       np.ndarray,
+    Sigma_noise:   np.ndarray,
+    n_sensors:     int,
+):
+    N = Sigma_Y.shape[0]
+    W_candidates = [np.eye(N)[:, i] for i in range(N)]
+
+    selected   = []
+    remaining  = list(range(N))
+
+    inc_inf = []
+    inc_sup = []
+
+    eig_inf = 0.0
+    eig_sup = 0.0
+
+    for m in range(n_sensors):
+
+        # W_m
+        if selected:
+            Wm = np.column_stack([W_candidates[i] for i in selected])
+        else:
+            Wm = np.empty((N, 0))
+
+        # matrices conditionnelles
+        Sigma_s_m   = schur(Sigma_signal,  Wm)
+        Sigma_yth_m = schur(Sigma_Y_theta, Wm)
+        Sigma_Y_m   = schur(Sigma_Y,       Wm)
+        Sigma_n_m   = schur(Sigma_noise,   Wm)
+
+        best_idx = None
+        best_inc = -np.inf
+        best_sup = None
+
         for idx in remaining:
-            S  = selected + [idx]
-            ix = np.ix_(S, S)
-            sy, ly = la.slogdet(Sigma_Y[ix])
-            sn, ln = la.slogdet(Sigma_noise[ix])
-            if sy <= 0 or sn <= 0:
+            w = W_candidates[idx]
+
+            num_inf = float(w.T @ Sigma_s_m   @ w)
+            den_inf = float(w.T @ Sigma_yth_m @ w)
+
+            num_sup = float(w.T @ Sigma_Y_m @ w)
+            den_sup = float(w.T @ Sigma_n_m @ w)
+
+            if min(num_inf, den_inf, num_sup, den_sup) <= 0:
                 continue
-            score = 0.5 * (ly - ln)
-            if score > best_score:
-                best_score, best_idx = score, idx
-        selected.append(best_idx)
-        remaining.remove(best_idx)
-    return np.asarray(selected, dtype=int)
 
+            d_inf = 0.5 * np.log(num_inf / den_inf)
+            d_sup = 0.5 * np.log(num_sup / den_sup)
 
-def incremental_bounds(Sigma_signal, Sigma_Y_theta, Sigma_Y, Sigma_noise, n_sensors):
-    """Sélection incrémentale maximisant la LB, retourne indices + courbes LB/UB."""
-    N_grid    = Sigma_Y.shape[0]
-    cands     = [np.eye(N_grid)[:, i] for i in range(N_grid)]
-    selected, remaining = [], list(range(N_grid))
-    scores_lb, scores_ub = [], []
-    eig_lb = eig_ub = 0.0
-
-    for _ in range(n_sensors):
-        Wm = (np.column_stack([cands[i] for i in selected])
-              if selected else np.empty((N_grid, 0)))
-        Ss  = schur(Sigma_signal,  Wm)
-        Syt = schur(Sigma_Y_theta, Wm)
-        SY  = schur(Sigma_Y,       Wm)
-        Sn  = schur(Sigma_noise,   Wm)
-
-        best_idx, best_lb, best_ub = None, -np.inf, None
-        for idx in remaining:
-            w = cands[idx]
-            n_lb = float(w @ Ss  @ w)
-            d_lb = float(w @ Syt @ w)
-            n_ub = float(w @ SY  @ w)
-            d_ub = float(w @ Sn  @ w)
-            if min(n_lb, d_lb, n_ub, d_ub) <= 0:
-                continue
-            dlb = 0.5 * np.log(n_lb / d_lb)
-            dub = 0.5 * np.log(n_ub / d_ub)
-            if dlb > best_lb:
-                best_lb, best_ub, best_idx = dlb, dub, idx
+            if d_inf > best_inc:
+                best_inc = d_inf
+                best_sup = d_sup
+                best_idx = idx
 
         if best_idx is None:
             break
+
         selected.append(best_idx)
         remaining.remove(best_idx)
-        eig_lb += best_lb
-        eig_ub += best_ub
-        scores_lb.append(eig_lb)
-        scores_ub.append(eig_ub)
 
-    if len(scores_lb) < n_sensors:
-        pad_val_lb = scores_lb[-1] if scores_lb else 0.0
-        pad_val_ub = scores_ub[-1] if scores_ub else 0.0
-        scores_lb.extend([pad_val_lb] * (n_sensors - len(scores_lb)))
-        scores_ub.extend([pad_val_ub] * (n_sensors - len(scores_ub)))
+        eig_inf += best_inc
+        eig_sup += best_sup
 
-    return np.asarray(selected, dtype=int), scores_lb, scores_ub
+        inc_inf.append(best_inc)
+        inc_sup.append(best_sup)
+
+    return {
+        "indices": np.array(selected, dtype=int),
+        "increments_lower": inc_inf,
+        "increments_upper": inc_sup,
+        "EIG_lower_bound": eig_inf,
+        "EIG_upper_bound": eig_sup,
+    }
 
 
 def incremental_bounds_given_W(Sigma_signal, Sigma_Y_theta, Sigma_Y, Sigma_noise, W):
@@ -451,32 +608,55 @@ def build_objects(lambda_):
 # Calcul des bornes pour un triplet (Sigma_signal, Sigma_Y, indices_selection)
 # =============================================================================
 
-def _bounds_for_W(Sigma_signal, Sigma_Y, Sigma_obs, indices, budgets):
+def _bounds_for_W(Sigma_signal, Sigma_Y, Sigma_obs, indices, budgets, method="cons"):
     """
     Pour un jeu de matrices fixé et des indices de sélection pré-calculés,
     retourne les 4 bornes (cons_lb, cons_ub, inc_lb, inc_ub) par budget.
     """
     cons_lb, cons_ub, inc_lb, inc_ub = [], [], [], []
-    for budget in budgets:
-        W, _ = build_selection_matrices(N, indices[:budget])
-        cons_lb.append(eig_BI(Sigma_Y, Sigma_obs, W))
-        cons_ub.append(eig_BS(Sigma_signal, Sigma_obs, W))
-        lb, ub = incremental_bounds_given_W(
-            Sigma_signal, Sigma_obs, Sigma_Y, Sigma_obs, W
-        )
-        inc_lb.append(lb)
-        inc_ub.append(ub)
+    if method == "cons" : 
+        for budget in budgets:
+            W, _ = build_selection_matrices(N, indices[:budget])
+            cons_lb.append(eig_BI(Sigma_Y, Sigma_obs, W))
+            cons_ub.append(eig_BS(Sigma_signal, Sigma_obs, W))
+            lb, ub = incremental_bounds_given_W(
+                Sigma_signal, Sigma_obs, Sigma_Y, Sigma_obs, W
+            )
+            inc_lb.append(lb)
+            inc_ub.append(ub)
+    elif method  == "inc" :
+        for budget in budgets:
+            result = incremental_bounds(
+                Sigma_signal  = Sigma_signal,
+                Sigma_Y_theta = Sigma_obs,
+                Sigma_Y       = Sigma_Y,
+                Sigma_noise   = Sigma_obs,
+                n_sensors     = budget,       
+            )
+            W, _ = build_selection_matrices(N, result['indices'])
+
+            lb = eig_BI(Sigma_Y, Sigma_obs, W)
+            ub = eig_BS(Sigma_signal, Sigma_obs, W)
+
+            cons_lb.append(lb)
+            cons_ub.append(ub)
+
+            inc_lb.append(result["EIG_lower_bound"])
+            inc_ub.append(result["EIG_upper_bound"])
     return cons_lb, cons_ub, inc_lb, inc_ub
+
+
 
 
 # =============================================================================
 # Une répétition
 # =============================================================================
 
-def run_one_repeat(lambda_, seed, Sigma_signal_free, Sigma_signal_free_nn):
+def run_one_repeat(lambda_, seed, eig_offset, Sigma_signal_free, Sigma_signal_free_nn):
     """
     Calcule Sigma_signal (FD) + Sigma_Y pour ce seed,
     puis les bornes pour les 3 variantes et les 2 méthodes de sélection.
+    L'offset EIG est sommé à toutes les bornes.
 
     Retourne un dict avec 12 listes de longueur n_budgets.
     """
@@ -488,12 +668,17 @@ def run_one_repeat(lambda_, seed, Sigma_signal_free, Sigma_signal_free_nn):
     l_theta      = estimate_E_JT(G, prior, N_SAMPLES, seed=seed)
     H_theta      = estimate_H_theta(G, prior, Sigma_obs, N_SAMPLES, seed=seed + 1)
     Sigma_Y      = estimate_Sigma_Y(G, prior, Sigma_obs, N_SAMPLES_SIGMA_Y, seed=seed + 2)
-    Sigma_signal = compute_Sigma_signal(
-        l_theta, H_theta, np.asarray(prior.Sigma), Sigma_obs
-    )
+    if lambda_ == 0 :
+        Sigma_signal = compute_Sigma_signal(
+            l_theta, H_theta, np.asarray(prior.Sigma), Sigma_obs
+        )
+    else:
+        Sigma_signal = compute_Sigma_signal_misfit(
+            l_theta, H_theta, np.asarray(prior.Sigma), Sigma_obs
+        )
 
     # --- Sélection incrémentale (basée sur Sigma_signal FD) ---
-    indices_inc, scores_lb_inc, scores_ub_inc = incremental_bounds(
+    result_inc = incremental_bounds(
         Sigma_signal, Sigma_obs, Sigma_Y, Sigma_obs, max_b
     )
 
@@ -502,40 +687,25 @@ def run_one_repeat(lambda_, seed, Sigma_signal_free, Sigma_signal_free_nn):
 
     result = {}
 
-    # Méthode : incremental — variante : fd
-    result["inc_fd_lb"] = scores_lb_inc[:max_b]
-    result["inc_fd_ub"] = scores_ub_inc[:max_b]
-    # Pour les bornes conservatives sur la même sélection inc :
-    clb, cub, _, _ = _bounds_for_W(Sigma_signal, Sigma_Y, Sigma_obs, indices_inc, budgets)
-    # (on les stocke dans cons_fd sur sélection incrémentale — voir note ci-dessous)
-
     # Méthode : conservative (indices_cons) — variantes fd / free / nn
-    for key, Ss in [("fd", Sigma_signal),
-                    ("free", Sigma_signal_free),
-                    ("nn", Sigma_signal_free_nn)]:
-        clb, cub, ilb, iub = _bounds_for_W(Ss, Sigma_Y, Sigma_obs, indices_cons, budgets)
-        result[f"cons_{key}_lb"] = clb
-        result[f"cons_{key}_ub"] = cub
-        result[f"cons_{key}_inc_lb"] = ilb   # bornes incrémentales évaluées sur sélection cons
-        result[f"cons_{key}_inc_ub"] = iub
+    # L'offset est sommé uniquement aux bornes conservatives (BI et BS)
+    # method : si indices cons ou inc
+    for method in ["cons","inc"]:
+        if method == "cons" : 
+            indices = indices_cons
+        elif method == "inc":
+            indices = result_inc["indices"]
 
-    # Méthode : incremental (indices_inc) — variantes free / nn
-    # (fd déjà fait via incremental_bounds directement)
-    for key, Ss in [("free", Sigma_signal_free),
-                    ("nn", Sigma_signal_free_nn)]:
-        # ré-optimise la sélection pour cette variante de Sigma_signal
-        idx_inc_var, slb, sub = incremental_bounds(
-            Ss, Sigma_obs, Sigma_Y, Sigma_obs, max_b
-        )
-        result[f"inc_{key}_lb"] = slb[:max_b]
-        result[f"inc_{key}_ub"] = sub[:max_b]
-
-    # On extrait aussi les scores inc_fd au bon format (par budget, pas par pas)
-    result["inc_fd_lb"] = [scores_lb_inc[b - 1] for b in budgets]
-    result["inc_fd_ub"] = [scores_ub_inc[b - 1] for b in budgets]
-    for key in ("free", "nn"):
-        result[f"inc_{key}_lb"] = [result[f"inc_{key}_lb"][b - 1] for b in budgets]
-        result[f"inc_{key}_ub"] = [result[f"inc_{key}_ub"][b - 1] for b in budgets]
+        for key, Ss in [("fd", Sigma_signal),
+                        ("free", Sigma_signal_free),
+                        ("nn", Sigma_signal_free_nn)]:
+            clb, cub, ilb, iub = _bounds_for_W(Ss, Sigma_Y, Sigma_obs, 
+                                indices, budgets, method)
+            
+            result[f"{method}_{key}_lb"]     = [v + eig_offset for v in clb]
+            result[f"{method}_{key}_ub"]     = [v + eig_offset for v in cub]
+            result[f"{method}_{key}_inc_lb"] = ilb
+            result[f"{method}_{key}_inc_ub"] = iub
 
     return result
 
@@ -562,9 +732,16 @@ def main():
             eig_offset = eig_linearise(G, prior, Sigma_obs)
             print(f"    eig_linearise = {eig_offset:.4f}")
         else:
-            eig_offset = estimate_eig_nmc(G, prior, Sigma_obs,
-                                           N_SAMPLES_EIG, seed=BASE_SEED)
-            print(f"    eig_nmc = {eig_offset:.4f}")
+            # eig_offset = estimate_eig_nmc(G, prior, Sigma_obs,
+            #                                N_SAMPLES_EIG, seed=BASE_SEED)
+            kl = KLPrior(prior.mu, prior.Sigma, energy=0.9999)
+
+            from functools import partial
+            J_G = partial(jacobian_fd, G) 
+            eig_offset = estimate_eig_kl(G, J_G, kl, 
+                                         Sigma_obs, N_SAMPLES_EIG, 
+                                         seed=BASE_SEED, n_jobs=-1)
+            print(f"EIG = {eig_offset:.4f}")
 
         # ------------------------------------------------------------------
         # 2. Sigma_Y_ref (une fois, beaucoup de samples)
@@ -600,7 +777,7 @@ def main():
                  for r in range(N_REPEATS)]
 
         repeat_results = Parallel(n_jobs=N_JOBS)(
-            delayed(run_one_repeat)(lam, s, Sigma_signal_free, Sigma_signal_free_nn)
+            delayed(run_one_repeat)(lam, s, eig_offset, Sigma_signal_free, Sigma_signal_free_nn)
             for s in seeds
         )
 
@@ -608,16 +785,19 @@ def main():
         # 6. Assemblage et sauvegarde
         # ------------------------------------------------------------------
         keys = [
-            "inc_fd_lb", "inc_fd_ub",
-            "inc_free_lb", "inc_free_ub",
-            "inc_nn_lb", "inc_nn_ub",
             "cons_fd_lb", "cons_fd_ub",
             "cons_fd_inc_lb", "cons_fd_inc_ub",
             "cons_free_lb", "cons_free_ub",
             "cons_free_inc_lb", "cons_free_inc_ub",
             "cons_nn_lb", "cons_nn_ub",
             "cons_nn_inc_lb", "cons_nn_inc_ub",
-        ]
+            "inc_fd_lb", "inc_fd_ub",
+            "inc_fd_inc_lb", "inc_fd_inc_ub",
+            "inc_free_lb", "inc_free_ub",
+            "inc_free_inc_lb", "inc_free_inc_ub",
+            "inc_nn_lb", "inc_nn_ub",
+            "inc_nn_inc_lb", "inc_nn_inc_ub",
+                    ]
 
         arrays = {}
         for k in keys:
@@ -628,9 +808,9 @@ def main():
             fname,
             # scalaires / matrices fixes
             eig_offset           = np.float64(eig_offset),
-            Sigma_signal_free    = Sigma_signal_free,
-            Sigma_signal_free_nn = Sigma_signal_free_nn,
-            Sigma_Y_ref          = Sigma_Y_ref,
+            # Sigma_signal_free    = Sigma_signal_free,
+            # Sigma_signal_free_nn = Sigma_signal_free_nn,
+            # Sigma_Y_ref          = Sigma_Y_ref,
             sensor_budgets       = np.array(SENSOR_BUDGETS),
             lambda_val           = np.float64(lam),
             n_repeats            = np.int64(N_REPEATS),
@@ -643,4 +823,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
