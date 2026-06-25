@@ -36,9 +36,9 @@ from boed.utils.observation import build_selection_matrices
 # Hyperparamètres
 # =============================================================================
 
-LAMBDAS        = [0.0, 0.25, 0.5, 1.0]
+LAMBDAS        = list(np.linspace(0, 0.05, 11))
 SENSOR_BUDGETS = [5, 10, 15, 20, 25]
-N_REPEATS      = 1
+N_REPEATS      = 50
 BASE_SEED      = 42
 N_JOBS         = -1
 
@@ -60,12 +60,12 @@ U0_AMPLITUDE    = 1.5
 N_SAMPLES             = 500    # l_theta, H_theta, Sigma_signal répétés
 N_SAMPLES_SIGMA_Y     = 500    # Sigma_Y répétés
 N_SAMPLES_SIGMA_Y_REF = 1500  # Sigma_Y_ref (une fois)
-N_SAMPLES_EIG         = 500  # eig
+N_SAMPLES_EIG         = 5000  # eig
 
 # NN
 N_TRAIN  = 100000
 N_TEST   = 2000
-N_EPOCHS = 30
+N_EPOCHS = 50
 HIDDEN   = [64, 64]
 
 OUTPUT_DIR = Path("results_sweep")
@@ -145,18 +145,15 @@ def compute_Sigma_signal(l_theta, H_theta, Sigma_theta, Sigma_obs):
     X = la.solve(A, l_theta)
     return np.asarray(Sigma_obs) + l_theta.T @ X
 
-def compute_Sigma_signal_misfit(l_theta, H_theta, Sigma_theta, Sigma_obs):
+def compute_Sigma_signal_misfit(l_theta, H_theta, Sigma_theta, Sigma_obs,tol=1e-4):
 
-    # Symmetric square root of Sigma_theta
     eigvals, eigvects = np.linalg.eigh(Sigma_theta)
-
-    # Numerical safeguard
     eigvals = np.clip(eigvals, 0.0, None)
 
     Sigma_theta_sqrt = (
-        eigvects
-        @ np.diag(np.sqrt(eigvals))
-        @ eigvects.T
+    eigvects
+    @ np.diag(np.sqrt(eigvals))
+    @ eigvects.T
     )
 
     H_misfit = (
@@ -165,16 +162,21 @@ def compute_Sigma_signal_misfit(l_theta, H_theta, Sigma_theta, Sigma_obs):
         @ Sigma_theta_sqrt
     )
 
-    I_plus_H_misfit = np.eye(H_misfit.shape[0]) + H_misfit
+    lam, V = np.linalg.eigh(H_misfit)
 
-    A = (
-        Sigma_theta_sqrt
-        @ la.solve(I_plus_H_misfit, Sigma_theta_sqrt)
-    )
+    mask = lam > tol
+    
+    lam = lam[mask]
+    V = V[:, mask]
 
-    X = la.solve(A, l_theta)
+    y = Sigma_theta_sqrt @ l_theta
+    Vy = V.T @ y
 
-    return Sigma_obs + l_theta.T @ X
+    coeff = lam / (1.0 + lam)
+
+    quad = y.T @ y - Vy.T @ (coeff[:, None] * Vy)
+
+    return Sigma_obs + quad
 
 
 
@@ -482,94 +484,244 @@ def greedy_maximize_LB(Sigma_Y, Sigma_noise, n_sensors):
     return np.array(selected, dtype=int)
 
 
-def schur(Sigma, Wm):
+# def schur(Sigma, Wm):
+#     if Wm.size == 0:
+#         return Sigma
+
+#     G = Wm.T @ Sigma @ Wm
+#     correction = Sigma @ Wm @ np.linalg.solve(G, Wm.T @ Sigma)
+
+#     return Sigma - correction
+
+
+# def incremental_bounds(
+#     Sigma_signal:  np.ndarray,
+#     Sigma_Y_theta: np.ndarray,
+#     Sigma_Y:       np.ndarray,
+#     Sigma_noise:   np.ndarray,
+#     n_sensors:     int,
+# ):
+#     N = Sigma_Y.shape[0]
+#     W_candidates = [np.eye(N)[:, i] for i in range(N)]
+
+#     selected   = []
+#     remaining  = list(range(N))
+
+#     inc_inf = []
+#     inc_sup = []
+
+#     eig_inf = 0.0
+#     eig_sup = 0.0
+
+#     for m in range(n_sensors):
+
+#         # W_m
+#         if selected:
+#             Wm = np.column_stack([W_candidates[i] for i in selected])
+#         else:
+#             Wm = np.empty((N, 0))
+
+#         # matrices conditionnelles
+#         Sigma_s_m   = schur(Sigma_signal,  Wm)
+#         Sigma_yth_m = schur(Sigma_Y_theta, Wm)
+#         Sigma_Y_m   = schur(Sigma_Y,       Wm)
+#         Sigma_n_m   = schur(Sigma_noise,   Wm)
+
+#         best_idx = None
+#         best_inc = -np.inf
+#         best_sup = None
+
+#         for idx in remaining:
+#             w = W_candidates[idx]
+
+#             num_inf = float(w.T @ Sigma_s_m   @ w)
+#             den_inf = float(w.T @ Sigma_yth_m @ w)
+
+#             num_sup = float(w.T @ Sigma_Y_m @ w)
+#             den_sup = float(w.T @ Sigma_n_m @ w)
+
+#             if min(num_inf, den_inf, num_sup, den_sup) <= 0:
+#                 continue
+
+#             d_inf = 0.5 * np.log(num_inf / den_inf)
+#             d_sup = 0.5 * np.log(num_sup / den_sup)
+
+#             if d_inf > best_inc:
+#                 best_inc = d_inf
+#                 best_sup = d_sup
+#                 best_idx = idx
+
+#         if best_idx is None:
+#             break
+
+#         selected.append(best_idx)
+#         remaining.remove(best_idx)
+
+#         eig_inf += best_inc
+#         eig_sup += best_sup
+
+#         inc_inf.append(best_inc)
+#         inc_sup.append(best_sup)
+
+#     return {
+#         "indices": np.array(selected, dtype=int),
+#         "increments_lower": inc_inf,
+#         "increments_upper": inc_sup,
+#         "EIG_lower_bound": eig_inf,
+#         "EIG_upper_bound": eig_sup,
+#     }
+
+
+
+
+def schur(Sigma: np.ndarray, Wm: np.ndarray) -> np.ndarray:
+    """Complément de Schur conditionnel.
+
+    Calcule Σ(Wm) = Σ - Σ Wm (WmᵀΣWm)⁻¹ Wmᵀ Σ,
+    c'est-à-dire la covariance de Σ conditionnée sur les directions Wm.
+
+    Utilise une factorisation de Cholesky pour garantir que le résultat
+    reste symétrique défini positif numériquement.
+
+    Parameters
+    ----------
+    Sigma : (N, N) ndarray, symétrique définie positive.
+    Wm    : (N, m) ndarray. Si m=0 (matrice vide), retourne Sigma inchangé.
+
+    Returns
+    -------
+    (N, N) ndarray : Σ(Wm), symétrique définie positive.
+    """
     if Wm.size == 0:
         return Sigma
-
-    G = Wm.T @ Sigma @ Wm
-    correction = Sigma @ Wm @ np.linalg.solve(G, Wm.T @ Sigma)
-
-    return Sigma - correction
+    G = Wm.T @ Sigma @ Wm          # (m, m)  SDP
+    L = np.linalg.cholesky(G)      # G = LLᵀ
+    B = np.linalg.solve(L, Wm.T @ Sigma)   # (m, N)  B = L⁻¹ WᵀΣ
+    return Sigma - B.T @ B         # Σ - BᵀB  symétrique par construction
 
 
 def incremental_bounds(
-    Sigma_signal:  np.ndarray,
-    Sigma_Y_theta: np.ndarray,
-    Sigma_Y:       np.ndarray,
-    Sigma_noise:   np.ndarray,
-    n_sensors:     int,
-):
+    Sigma_signal:        np.ndarray,
+    Sigma_Y_given_theta: np.ndarray,
+    Sigma_Y:             np.ndarray,
+    Sigma_noise:         np.ndarray,
+    n_sensors:           int,
+) -> dict:
+    """Placement glouton de capteurs par bornes incrémentales sur l'EIG.
+
+    Implémente le théorème suivant : pour W_new = eᵢ,
+
+        EIG(Wm ∪ {i}) ≥ EIG(Wm) + ½ log [Σ_signal(Wm)]ᵢᵢ / [Σ_{Y|θ}(Wm)]ᵢᵢ   (borne inf)
+        EIG(Wm ∪ {i}) ≤ EIG(Wm) + ½ log [Σ_Y(Wm)]ᵢᵢ     / [Σ_noise(Wm)]ᵢᵢ    (borne sup)
+
+    où Σ_*(Wm) désigne le complément de Schur de Σ_* conditionné sur Wm
+    (cf. équations (11)–(14) du théorème de référence).
+
+    La sélection gloutonne maximise la borne inférieure à chaque étape.
+    La borne supérieure accumulée correspond à la même séquence de capteurs
+    (elle n'est pas nécessairement la borne sup glouton-optimale).
+
+    Parameters
+    ----------
+    Sigma_signal        : (N, N)  Covariance a priori du paramètre θ.  Éq. (11).
+    Sigma_Y_given_theta : (N, N)  Covariance de Y|θ (bruit d'observation).  Éq. (13).
+                          ⚠ Ne pas confondre avec Σ_{θ|Y} (posterior sur θ).
+    Sigma_Y             : (N, N)  Covariance marginale de Y.  Éq. (14).
+    Sigma_noise         : (N, N)  Covariance du bruit capteur.  Éq. (12).
+    n_sensors           : int     Nombre de capteurs à sélectionner.
+
+    Returns
+    -------
+    dict avec les clés :
+        "indices"          : (n_sensors,) int    — indices sélectionnés dans l'ordre.
+        "increments_lower" : list[float]         — δ⁻(i*_m, m) à chaque étape.
+        "increments_upper" : list[float]         — δ⁺(i*_m, m) à chaque étape.
+        "EIG_lower_bound"  : float               — borne inf cumulée sur EIG(S_n).
+        "EIG_upper_bound"  : float               — borne sup cumulée sur EIG(S_n).
+    """
     N = Sigma_Y.shape[0]
-    W_candidates = [np.eye(N)[:, i] for i in range(N)]
+    assert Sigma_signal.shape        == (N, N), "Sigma_signal: dimension incorrecte"
+    assert Sigma_Y_given_theta.shape == (N, N), "Sigma_Y_given_theta: dimension incorrecte"
+    assert Sigma_noise.shape         == (N, N), "Sigma_noise: dimension incorrecte"
+    assert 1 <= n_sensors <= N,                 "n_sensors hors borne"
 
-    selected   = []
-    remaining  = list(range(N))
+    # Copies de travail pour les mises à jour de Schur incrémentales.
+    # À l'étape m, S_*[i,i] = [Σ_*(W_m)]ᵢᵢ sans recalcul depuis zéro.
+    S_s   = Sigma_signal.copy()
+    S_yth = Sigma_Y_given_theta.copy()
+    S_Y   = Sigma_Y.copy()
+    S_n   = Sigma_noise.copy()
 
-    inc_inf = []
-    inc_sup = []
+    selected:  list[int]   = []
+    remaining: list[int]   = list(range(N))
+    inc_inf:   list[float] = []
+    inc_sup:   list[float] = []
+    eig_inf = eig_sup = 0.0
 
-    eig_inf = 0.0
-    eig_sup = 0.0
-
-    for m in range(n_sensors):
-
-        # W_m
-        if selected:
-            Wm = np.column_stack([W_candidates[i] for i in selected])
-        else:
-            Wm = np.empty((N, 0))
-
-        # matrices conditionnelles
-        Sigma_s_m   = schur(Sigma_signal,  Wm)
-        Sigma_yth_m = schur(Sigma_Y_theta, Wm)
-        Sigma_Y_m   = schur(Sigma_Y,       Wm)
-        Sigma_n_m   = schur(Sigma_noise,   Wm)
-
-        best_idx = None
-        best_inc = -np.inf
-        best_sup = None
+    for _ in range(n_sensors):
+        best_idx  = None
+        best_dinf = -np.inf
+        best_dsup = None
 
         for idx in remaining:
-            w = W_candidates[idx]
+            num_inf = S_s[idx, idx]
+            den_inf = S_yth[idx, idx]
+            num_sup = S_Y[idx, idx]
+            den_sup = S_n[idx, idx]
 
-            num_inf = float(w.T @ Sigma_s_m   @ w)
-            den_inf = float(w.T @ Sigma_yth_m @ w)
-
-            num_sup = float(w.T @ Sigma_Y_m @ w)
-            den_sup = float(w.T @ Sigma_n_m @ w)
-
-            if min(num_inf, den_inf, num_sup, den_sup) <= 0:
+            # Les variances conditionnelles doivent être > 0 (SDP).
+            # Une valeur nulle ou négative signale une dégénérescence numérique.
+            if min(num_inf, den_inf, num_sup, den_sup) <= 1e-14:
+                warnings.warn(
+                    f"Variance conditionnelle quasi-nulle pour le capteur {idx} "
+                    f"(num_inf={num_inf:.2e}, den_inf={den_inf:.2e}, "
+                    f"num_sup={num_sup:.2e}, den_sup={den_sup:.2e}). "
+                    "Capteur ignoré — vérifier le conditionnement des matrices.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
                 continue
 
             d_inf = 0.5 * np.log(num_inf / den_inf)
             d_sup = 0.5 * np.log(num_sup / den_sup)
 
-            if d_inf > best_inc:
-                best_inc = d_inf
-                best_sup = d_sup
-                best_idx = idx
+            if d_inf > best_dinf:
+                best_dinf = d_inf
+                best_dsup = d_sup
+                best_idx  = idx
 
         if best_idx is None:
+            warnings.warn(
+                f"Aucun capteur valide à l'étape {len(selected)+1}/{n_sensors}. "
+                "Arrêt prématuré.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             break
+
+        # Mise à jour incrémentale de Schur par rang 1 :
+        #   Σ_*(W_{m+1}) = Σ_*(W_m) - [Σ_*(W_m) eᵢ eᵢᵀ Σ_*(W_m)] / [Σ_*(W_m)]ᵢᵢ
+        # Complexité O(N²) par étape au lieu de O(N³).
+        for S in (S_s, S_yth, S_Y, S_n):
+            col = S[:, best_idx].copy()          # Σ eᵢ
+            S -= np.outer(col, col) / S[best_idx, best_idx]
 
         selected.append(best_idx)
         remaining.remove(best_idx)
-
-        eig_inf += best_inc
-        eig_sup += best_sup
-
-        inc_inf.append(best_inc)
-        inc_sup.append(best_sup)
+        eig_inf += best_dinf
+        eig_sup += best_dsup
+        inc_inf.append(best_dinf)
+        inc_sup.append(best_dsup)
 
     return {
-        "indices": np.array(selected, dtype=int),
+        "indices":          np.array(selected, dtype=int),
         "increments_lower": inc_inf,
         "increments_upper": inc_sup,
-        "EIG_lower_bound": eig_inf,
-        "EIG_upper_bound": eig_sup,
+        "EIG_lower_bound":  eig_inf,
+        "EIG_upper_bound":  eig_sup,
     }
 
-
+    
 def incremental_bounds_given_W(Sigma_signal, Sigma_Y_theta, Sigma_Y, Sigma_noise, W):
     """Bornes LB/UB pour un W donné (sans ré-optimiser la sélection)."""
     _, ls = la.slogdet(W.T @ Sigma_signal  @ W)
@@ -628,7 +780,7 @@ def _bounds_for_W(Sigma_signal, Sigma_Y, Sigma_obs, indices, budgets, method="co
         for budget in budgets:
             result = incremental_bounds(
                 Sigma_signal  = Sigma_signal,
-                Sigma_Y_theta = Sigma_obs,
+                Sigma_Y_given_theta = Sigma_obs,
                 Sigma_Y       = Sigma_Y,
                 Sigma_noise   = Sigma_obs,
                 n_sensors     = budget,       
@@ -668,14 +820,9 @@ def run_one_repeat(lambda_, seed, eig_offset, Sigma_signal_free, Sigma_signal_fr
     l_theta      = estimate_E_JT(G, prior, N_SAMPLES, seed=seed)
     H_theta      = estimate_H_theta(G, prior, Sigma_obs, N_SAMPLES, seed=seed + 1)
     Sigma_Y      = estimate_Sigma_Y(G, prior, Sigma_obs, N_SAMPLES_SIGMA_Y, seed=seed + 2)
-    if lambda_ == 0 :
-        Sigma_signal = compute_Sigma_signal(
-            l_theta, H_theta, np.asarray(prior.Sigma), Sigma_obs
-        )
-    else:
-        Sigma_signal = compute_Sigma_signal_misfit(
-            l_theta, H_theta, np.asarray(prior.Sigma), Sigma_obs
-        )
+    Sigma_signal = compute_Sigma_signal_misfit(
+        l_theta, H_theta, np.asarray(prior.Sigma), Sigma_obs
+    )
 
     # --- Sélection incrémentale (basée sur Sigma_signal FD) ---
     result_inc = incremental_bounds(
@@ -727,7 +874,7 @@ def main():
         # ------------------------------------------------------------------
         # 1. EIG offset (une fois)
         # ------------------------------------------------------------------
-        print("  [1/4] EIG offset...")
+        print("  [1/3] EIG offset...")
         if lam == 0.0:
             eig_offset = eig_linearise(G, prior, Sigma_obs)
             print(f"    eig_linearise = {eig_offset:.4f}")
@@ -744,24 +891,17 @@ def main():
             print(f"EIG = {eig_offset:.4f}")
 
         # ------------------------------------------------------------------
-        # 2. Sigma_Y_ref (une fois, beaucoup de samples)
+        # 2. Sigma_signal_free via régression linéaire (une fois)
         # ------------------------------------------------------------------
-        print("  [2/4] Sigma_Y_ref...")
-        Sigma_Y_ref = estimate_Sigma_Y(G, prior, Sigma_obs,
-                                        N_SAMPLES_SIGMA_Y_REF, seed=BASE_SEED)
-
-        # ------------------------------------------------------------------
-        # 3. Sigma_signal_free via régression linéaire (une fois)
-        # ------------------------------------------------------------------
-        print("  [3/4] Sigma_signal_free (régression linéaire)...")
+        print("  [2/3] Sigma_signal_free (régression linéaire)...")
         Sigma_signal_free = compute_Sigma_signal_free_linear(
             G, prior, Sigma_obs, n_samples=10000, seed=BASE_SEED
         )
 
         # ------------------------------------------------------------------
-        # 4. Sigma_signal_free_nn via NN (une fois)
+        # 3. Sigma_signal_free_nn via NN (une fois)
         # ------------------------------------------------------------------
-        print("  [4/4] Sigma_signal_free_nn (NN)...")
+        print("  [3/3] Sigma_signal_free_nn (NN)...")
         Sigma_signal_free_nn = compute_Sigma_signal_free_nn(
             G, prior, Sigma_obs,
             n_train=N_TRAIN, n_test=N_TEST,
@@ -770,7 +910,7 @@ def main():
         )
 
         # ------------------------------------------------------------------
-        # 5. Répétitions
+        # 4. Répétitions
         # ------------------------------------------------------------------
         print(f"  Repeats (n={N_REPEATS})...")
         seeds = [BASE_SEED + 1000 * LAMBDAS.index(lam) + r
@@ -782,7 +922,7 @@ def main():
         )
 
         # ------------------------------------------------------------------
-        # 6. Assemblage et sauvegarde
+        # 5. Assemblage et sauvegarde
         # ------------------------------------------------------------------
         keys = [
             "cons_fd_lb", "cons_fd_ub",

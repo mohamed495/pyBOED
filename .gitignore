@@ -20,3 +20,5 @@ venv/
 *.txt
 *.err
 *.outtutorials/examples/boed/results_sweep/*.npz
+tutorials/examples/boed/results_sweep/*.npz
+tutorials/examples/boed/*.out
