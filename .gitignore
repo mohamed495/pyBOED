@@ -18,3 +18,5 @@ venv/
 *.csv
 *.npz
 *.txt
+*.err
+*.outtutorials/examples/boed/results_sweep/*.npz
