@@ -1,34 +1,44 @@
 """
 run_bounds_GO.py
 ----------------
-Répète l'expérience du tuto_bounds_GO pour plusieurs valeurs de lambda_,
-plusieurs seeds, et produit deux figures :
+Répétition scriptable de tuto_bounds_GO (notebook).
+Structure : multi-lambda × multi-seed, sauvegarde .npz par lambda.
 
-  - Figure 1 : sélection incrémentale  (incremental_bounds)
-  - Figure 2 : sélection conservative  (greedy_maximize_LB)
+Une fois par lambda :
+  - Sigma_Y_given_theta   (MC imbriqué)
+  - Sigma_signal_free     (régression Y → G)
+  - Sigma_noise_free      (régression (theta,Y) → G)
+  - eig_offset            (estimateur KL sur theta, bruit = Sigma_Y_given_theta)
 
-Chaque figure contient 4 subplots (un par lambda) avec les boxplots des 4 bornes
-(conservative LB/UB, incremental LB/UB) en fonction du budget.
+Par répétition (seed variable) :
+  - E[J^T], Cov(J)        (différences finies)
+  - Sigma_Y               (MC marginal)
+  - Sigma_signal, Sigma_signal_misfit
+  - Sigma_noise,  Sigma_noise_misfit
+  → bornes {cons,inc} × {fd,free}
+
+Clés .npz : {method}_{variant}_{lb,ub,inc_lb,inc_ub}
+  method  : cons (greedy BI), inc (glouton incrémental)
+  variant : fd (jacobiens FD), free (gradient-free)
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import warnings
+from functools import partial
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/pyboed_mpl")
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import numpy.linalg as la
+import scipy.linalg as sla
 from joblib import Parallel, delayed
 
-# --- ajout du repo au path si nécessaire ---
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parents[2]
+REPO_ROOT  = SCRIPT_DIR.parents[2]
 for p in (SCRIPT_DIR, REPO_ROOT):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
@@ -39,17 +49,16 @@ from boed.priors.gp_priors import GaussianProcessPrior
 from boed.priors.kernels import Matern32
 from boed.utils.observation import build_selection_matrices
 
-# ============================================================
-# Paramètres de l'expérience
-# ============================================================
+# =============================================================================
+# Paramètres
+# =============================================================================
 
-LAMBDAS        = [0.0, 0.25, 0.5, 1.0]
+LAMBDAS        = [0.0]
 SENSOR_BUDGETS = [5, 10, 15, 20, 25]
-N_REPEATS      = 10
+N_REPEATS      = 1
 BASE_SEED      = 42
 N_JOBS         = -1
 
-# Hyperparamètres du modèle (identiques au tuto GO)
 N           = 100
 DT          = 0.001
 N_STEPS     = 100
@@ -59,18 +68,46 @@ DIFFUSIVITY = 0.02
 KERNEL_LS   = 0.2
 KERNEL_SIG  = 1.0
 
-# Nombre d'échantillons MC
-N_SAMPLES               = 500
-N_SAMPLES_SIGMA_Y       = 2000
-N_SAMPLES_Y_GIVEN_THETA = 500
-N_SAMPLES_EIG           = 100000
-N_ETA_INNER            = 200
+N_SAMPLES         = 500    # FD jacobiens par repeat
+N_SAMPLES_SIGMA_Y = 500    # Sigma_Y par repeat
+N_THETA_YTH       = 500    # n_theta pour estimate_E_cov_Y_given_theta
+N_ETA_INNER       = 200    # n_eta  pour estimate_E_cov_Y_given_theta
+N_SAMPLES_FREE    = 20000  # régression gradient-free (une fois)
+N_SAMPLES_EIG     = 2000   # estimateur KL EIG (une fois)
 
 OUTPUT_DIR = Path("results_sweep")
 
-# ============================================================
-# Monte Carlo helpers
-# ============================================================
+# =============================================================================
+# Prior joint et forward model
+# =============================================================================
+
+def build_objects(lambda_):
+    model  = Burgers_CN(N=N, dt=DT, diffusivity=DIFFUSIVITY, lambda_=lambda_)
+    kernel = Matern32(length_scale=KERNEL_LS, sigma=KERNEL_SIG)
+    try:
+        prior = GaussianProcessPrior(kernel, mu=np.zeros(N), nx=N)
+    except TypeError:
+        prior = GaussianProcessPrior(kernel, nx=N)
+        prior.mu = np.zeros(N)
+
+    eigvals = la.eigvalsh(prior.Sigma)
+    prior.Sigma += eigvals[-1] / 1000.0
+
+    d = q = N // 2
+    joint_prior = {"mu": prior.mu, "Sigma": prior.Sigma, "d": d, "q": q}
+
+    noise     = NoiseModel(sigma_noise=SIGMA)
+    Sigma_obs = noise.get_covariance(N)
+
+    def G(theta, eta):
+        u0 = np.concatenate((theta, eta), axis=None)
+        return model.evolve(u0=u0, n_steps=N_STEPS)[-1, :]
+
+    return prior, joint_prior, Sigma_obs, G
+
+# =============================================================================
+# MC : prior joint
+# =============================================================================
 
 def sample_joint_prior(joint_prior, n_samples, rng=None):
     if rng is None:
@@ -79,207 +116,291 @@ def sample_joint_prior(joint_prior, n_samples, rng=None):
     z = rng.multivariate_normal(mean=joint_prior["mu"], cov=joint_prior["Sigma"], size=n_samples)
     return z[:, :d], z[:, d:]
 
+# =============================================================================
+# Jacobiens par différences finies
+# =============================================================================
 
 def jacobian_fd_theta(G, theta, eta, h=None):
     d = theta.shape[0]
-    if h is None:
-        h = np.finfo(float).eps ** (1 / 3) * (la.norm(theta) + 1e-8)
+    h = h or np.finfo(float).eps ** (1/3) * (la.norm(theta) + 1e-8)
     m = G(theta, eta).shape[0]
     J = np.zeros((m, d))
     for j in range(d):
-        e_j = np.zeros(d)
-        e_j[j] = 1.0
-        J[:, j] = (G(theta + h * e_j, eta) - G(theta - h * e_j, eta)) / (2 * h)
+        ej = np.zeros(d); ej[j] = 1.0
+        J[:, j] = (G(theta + h*ej, eta) - G(theta - h*ej, eta)) / (2*h)
     return J
 
 
 def jacobian_fd_eta(G, theta, eta, h=None):
     q = eta.shape[0]
-    if h is None:
-        h = np.finfo(float).eps ** (1 / 3) * (la.norm(eta) + 1e-8)
+    h = h or np.finfo(float).eps ** (1/3) * (la.norm(eta) + 1e-8)
     m = G(theta, eta).shape[0]
     J = np.zeros((m, q))
     for j in range(q):
-        e_j = np.zeros(q)
-        e_j[j] = 1.0
-        J[:, j] = (G(theta, eta + h * e_j) - G(theta, eta - h * e_j)) / (2 * h)
+        ej = np.zeros(q); ej[j] = 1.0
+        J[:, j] = (G(theta, eta + h*ej) - G(theta, eta - h*ej)) / (2*h)
     return J
 
 
 def _one_sample(G, theta, eta):
-    J_theta_T = jacobian_fd_theta(G, theta, eta).T
-    J_eta_T = jacobian_fd_eta(G, theta, eta).T
-    return J_theta_T, J_eta_T
+    return jacobian_fd_theta(G, theta, eta).T, jacobian_fd_eta(G, theta, eta).T
 
 
 def estimate_E_JT(G, joint_prior, n_samples, rng=None):
-    theta_samples, eta_samples = sample_joint_prior(joint_prior, n_samples, rng=rng)
+    """E[J_theta^T] (d,m), E[J_eta^T] (q,m) et leur concaténation (d+q,m)."""
+    theta_s, eta_s = sample_joint_prior(joint_prior, n_samples, rng=rng)
     results = Parallel(n_jobs=N_JOBS)(
-        delayed(_one_sample)(G, theta_samples[k], eta_samples[k])
-        for k in range(n_samples)
+        delayed(_one_sample)(G, theta_s[k], eta_s[k]) for k in range(n_samples)
     )
-    J_theta_T_0, J_eta_T_0 = results[0]
-    EJ_theta_T_sum = np.zeros_like(J_theta_T_0, dtype=float)
-    EJ_eta_T_sum = np.zeros_like(J_eta_T_0, dtype=float)
+    Jt0, Je0 = results[0]
+    Jt_sum = np.zeros_like(Jt0); Je_sum = np.zeros_like(Je0)
     for Jt, Je in results:
-        EJ_theta_T_sum += Jt
-        EJ_eta_T_sum += Je
-    EJ_theta_T = EJ_theta_T_sum / n_samples
-    EJ_eta_T = EJ_eta_T_sum / n_samples
-    EJ_full_T = np.concatenate((EJ_theta_T, EJ_eta_T), axis=0)
-    return {
-        "EJ_theta_T": EJ_theta_T,
-        "EJ_eta_T": EJ_eta_T,
-        "EJ_full_T": EJ_full_T,
-    }
+        Jt_sum += Jt; Je_sum += Je
+    EJt = Jt_sum / n_samples
+    EJe = Je_sum / n_samples
+    return {"EJ_theta_T": EJt, "EJ_eta_T": EJe, "EJ_full_T": np.vstack([EJt, EJe])}
 
 
-def _compute_z(theta, eta, G, h_theta, h_eta, Sigma_inv_sqrt):
-    J_theta = jacobian_fd_theta(G, theta, eta, h=h_theta)
-    J_eta = jacobian_fd_eta(G, theta, eta, h=h_eta)
-    Z_theta = J_theta.T @ Sigma_inv_sqrt
-    Z_eta = J_eta.T @ Sigma_inv_sqrt
-    return Z_theta, Z_eta
+def _compute_z(theta, eta, G, Sinv_sqrt):
+    Zt = jacobian_fd_theta(G, theta, eta).T @ Sinv_sqrt
+    Ze = jacobian_fd_eta(G,  theta, eta).T @ Sinv_sqrt
+    return Zt, Ze
 
 
-def estimate_jacobian_covariances_mc(
-    G, joint_prior, Sigma_obs, n_samples,
-    h_theta=None, h_eta=None, unbiased=False, rng=None, n_jobs=-1,
-):
-    Sigma_obs = np.asarray(Sigma_obs, dtype=float)
-    evals, evecs = la.eigh(Sigma_obs)
-    if np.any(evals <= 0):
-        raise ValueError("Sigma_obs must be symmetric positive definite.")
-    Sigma_inv_sqrt = evecs @ np.diag(1.0 / np.sqrt(evals)) @ evecs.T
-    theta_samples, eta_samples = sample_joint_prior(joint_prior, n_samples, rng=rng)
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(_compute_z)(theta_samples[k], eta_samples[k], G, h_theta, h_eta, Sigma_inv_sqrt)
-        for k in range(n_samples)
+def estimate_jacobian_covariances_mc(G, joint_prior, Sigma_obs, n_samples, rng=None):
+    """Cov_theta, Cov_eta, Cov_theta_eta, Cov_full."""
+    evals, evecs = la.eigh(np.asarray(Sigma_obs, dtype=float))
+    Sinv_sqrt = evecs @ np.diag(1.0 / np.sqrt(evals)) @ evecs.T
+    theta_s, eta_s = sample_joint_prior(joint_prior, n_samples, rng=rng)
+    results = Parallel(n_jobs=N_JOBS)(
+        delayed(_compute_z)(theta_s[k], eta_s[k], G, Sinv_sqrt) for k in range(n_samples)
     )
-    Z_theta_list, Z_eta_list = zip(*results)
-    Z_theta_arr = np.asarray(Z_theta_list, dtype=float)
-    Z_eta_arr = np.asarray(Z_eta_list, dtype=float)
-    Z_theta_mean = np.mean(Z_theta_arr, axis=0)
-    Z_eta_mean = np.mean(Z_eta_arr, axis=0)
-    d_theta = Z_theta_mean.shape[0]
-    d_eta = Z_eta_mean.shape[0]
-    Cov_theta = np.zeros((d_theta, d_theta))
-    Cov_eta = np.zeros((d_eta, d_eta))
-    Cov_theta_eta = np.zeros((d_theta, d_eta))
+    Zt_arr = np.asarray([r[0] for r in results])
+    Ze_arr = np.asarray([r[1] for r in results])
+    Zt_m = Zt_arr.mean(axis=0); Ze_m = Ze_arr.mean(axis=0)
+    Ct = np.zeros((Zt_m.shape[0],)*2)
+    Ce = np.zeros((Ze_m.shape[0],)*2)
+    Cte = np.zeros((Zt_m.shape[0], Ze_m.shape[0]))
     for k in range(n_samples):
-        Dt = Z_theta_arr[k] - Z_theta_mean
-        De = Z_eta_arr[k] - Z_eta_mean
-        Cov_theta += Dt @ Dt.T
-        Cov_eta += De @ De.T
-        Cov_theta_eta += Dt @ De.T
-    denom = (n_samples - 1) if (unbiased and n_samples > 1) else n_samples
-    Cov_theta /= denom
-    Cov_eta /= denom
-    Cov_theta_eta /= denom
-    Cov_theta = 0.5 * (Cov_theta + Cov_theta.T)
-    Cov_eta = 0.5 * (Cov_eta + Cov_eta.T)
-    Cov_full = np.block([
-        [Cov_theta, Cov_theta_eta],
-        [Cov_theta_eta.T, Cov_eta],
-    ])
+        dt = Zt_arr[k] - Zt_m; de = Ze_arr[k] - Ze_m
+        Ct += dt @ dt.T; Ce += de @ de.T; Cte += dt @ de.T
+    Ct  = 0.5*(Ct  + Ct.T) / n_samples
+    Ce  = 0.5*(Ce  + Ce.T) / n_samples
+    Cte /= n_samples
     return {
-        "Cov_theta": Cov_theta,
-        "Cov_eta": Cov_eta,
-        "Cov_theta_eta": Cov_theta_eta,
-        "Cov_full": Cov_full,
+        "Cov_theta":     Ct,
+        "Cov_eta":       Ce,
+        "Cov_theta_eta": Cte,
+        "Cov_full":      np.block([[Ct, Cte], [Cte.T, Ce]]),
     }
 
 
 def estimate_Sigma_Y(G, joint_prior, Sigma_obs, n_samples, rng=None):
-    theta_samples, eta_samples = sample_joint_prior(joint_prior, n_samples, rng=rng)
-    U = Parallel(n_jobs=N_JOBS)(delayed(G)(theta_samples[k], eta_samples[k]) for k in range(n_samples))
-    U = np.asarray(U)
+    theta_s, eta_s = sample_joint_prior(joint_prior, n_samples, rng=rng)
+    U = np.asarray(Parallel(n_jobs=N_JOBS)(
+        delayed(G)(theta_s[k], eta_s[k]) for k in range(n_samples)
+    ))
     SY = np.asarray(Sigma_obs) + np.cov(U, rowvar=False, bias=False)
-    return 0.5 * (SY + SY.T)
+    return 0.5*(SY + SY.T)
 
 
-def estimate_E_cov_Y_given_theta(G, joint_prior, Sigma_obs, n_theta, n_eta, rng=None, n_jobs=-1):
-    if rng is None:
-        rng = np.random.default_rng()
-    if n_eta < 2:
-        raise ValueError("n_eta must be >= 2 to estimate a covariance.")
-    d = joint_prior["d"]
-    q = joint_prior["q"]
-    mu = joint_prior["mu"]
-    Sigma = joint_prior["Sigma"]
-    mu_theta = mu[:d]
-    mu_eta = mu[d:]
-    Sigma_theta = Sigma[:d, :d]
-    Sigma_eta = Sigma[d:, d:]
-    Sigma_et = Sigma[d:, :d]
-    Sigma_theta_inv_Sigma_te = la.solve(Sigma_theta, Sigma_et.T)
-    Sigma_eta_given_theta = Sigma_eta - Sigma_et @ Sigma_theta_inv_Sigma_te
-    Sigma_eta_given_theta = 0.5 * (Sigma_eta_given_theta + Sigma_eta_given_theta.T)
-    Sigma_eta_given_theta += 1e-12 * np.eye(q)
-    theta_samples = rng.multivariate_normal(mean=mu_theta, cov=Sigma_theta, size=n_theta)
-    base_seed = rng.integers(0, 2**30)
-    inner_cov_list = Parallel(n_jobs=n_jobs)(
-        delayed(_process_theta)(i, theta_samples[i], mu_theta, Sigma_theta, mu_eta,
-                                Sigma_et, Sigma_eta_given_theta, G, n_eta, base_seed)
-        for i in range(n_theta)
-    )
-    result = Sigma_obs + np.mean(np.asarray(inner_cov_list), axis=0)
-    return 0.5 * (result + result.T)
-
-
-def _process_theta(i, theta_i, mu_theta, Sigma_theta, mu_eta, Sigma_et, Sigma_eta_given_theta, G, n_eta, base_seed):
+def _process_theta(i, theta_i, mu_theta, Sigma_theta, mu_eta, Sigma_et,
+                   Sigma_eta_given_theta, G, n_eta, base_seed):
     rng = np.random.default_rng(base_seed + i)
-    mu_eta_given_theta_i = mu_eta + Sigma_et @ la.solve(Sigma_theta, theta_i - mu_theta)
-    eta_cond = rng.multivariate_normal(mean=mu_eta_given_theta_i, cov=Sigma_eta_given_theta, size=n_eta)
-    vals = np.asarray([G(theta_i, eta_cond[j]) for j in range(n_eta)])
+    mu_eta_i = mu_eta + Sigma_et @ la.solve(Sigma_theta, theta_i - mu_theta)
+    eta_cond  = rng.multivariate_normal(mean=mu_eta_i, cov=Sigma_eta_given_theta, size=n_eta)
+    vals = np.array([G(theta_i, eta_cond[j]) for j in range(n_eta)])
     if vals.ndim == 1:
         vals = vals[:, None]
     return np.cov(vals, rowvar=False, ddof=1)
 
 
-def compute_Sigma_signal(l_theta, H_theta, Sigma_theta, Sigma_obs):
-    HS = H_theta @ Sigma_theta
-    M = Sigma_theta - Sigma_theta @ la.solve(np.eye(Sigma_theta.shape[0]) + HS, HS)
-    return Sigma_obs + l_theta.T @ M @ l_theta
+def estimate_E_cov_Y_given_theta(G, joint_prior, Sigma_obs, n_theta, n_eta, rng=None, n_jobs=-1):
+    """E_theta[Cov(Y|theta)] = Sigma_obs + E_theta[Cov(G(theta,eta)|theta)]."""
+    if rng is None:
+        rng = np.random.default_rng()
+    d = joint_prior["d"]
+    mu, Sigma = joint_prior["mu"], joint_prior["Sigma"]
+    mu_theta   = mu[:d];  Sigma_theta = Sigma[:d, :d]
+    mu_eta     = mu[d:];  Sigma_eta   = Sigma[d:, d:]
+    Sigma_et   = Sigma[d:, :d]
+    Sigma_eGt  = Sigma_eta - Sigma_et @ la.solve(Sigma_theta, Sigma_et.T)
+    Sigma_eGt  = 0.5*(Sigma_eGt + Sigma_eGt.T) + 1e-12*np.eye(Sigma_eta.shape[0])
+    theta_s    = rng.multivariate_normal(mean=mu_theta, cov=Sigma_theta, size=n_theta)
+    base_seed  = int(rng.integers(0, 2**30))
+    cov_list   = Parallel(n_jobs=n_jobs)(
+        delayed(_process_theta)(i, theta_s[i], mu_theta, Sigma_theta, mu_eta,
+                                Sigma_et, Sigma_eGt, G, n_eta, base_seed)
+        for i in range(n_theta)
+    )
+    result = np.asarray(Sigma_obs) + np.mean(np.asarray(cov_list), axis=0)
+    return 0.5*(result + result.T)
+
+# =============================================================================
+# Matrices de covariance signal / bruit
+# =============================================================================
+
+def compute_Sigma_signal(l_theta_eta, H_theta_eta, Sigma_theta_eta, Sigma_obs):
+    N_loc = Sigma_theta_eta.shape[0]
+    HS = H_theta_eta @ Sigma_theta_eta
+    M  = Sigma_theta_eta - Sigma_theta_eta @ la.solve(np.eye(N_loc) + HS, HS)
+    return np.asarray(Sigma_obs) + l_theta_eta.T @ M @ l_theta_eta
 
 
-def logsumexp_rows(A):
-    amax = A.max(axis=1, keepdims=True)
-    return amax.squeeze() + np.log(np.exp(A - amax).sum(axis=1))
+def compute_Sigma_signal_misfit(l_theta_eta, H_theta_eta, Sigma_theta_eta, Sigma_obs):
+    eigvals, eigvects = la.eigh(np.asarray(Sigma_theta_eta))
+    eigvals = np.clip(eigvals, 0.0, None)
+    Ssqrt = eigvects @ np.diag(np.sqrt(eigvals)) @ eigvects.T
+    H_m   = Ssqrt @ H_theta_eta @ Ssqrt
+    A     = Ssqrt @ la.solve(np.eye(H_m.shape[0]) + H_m, Ssqrt)  # = (Sigma^{-1}+H)^{-1}
+    X     = A @ l_theta_eta
+    return np.asarray(Sigma_obs) + l_theta_eta.T @ X
 
 
-def estimate_eig_memory_efficient(G, joint_prior, Sigma_obs, n_samples, batch_size=500, seed=None):
-    if n_samples < 2:
-        raise ValueError("n_samples doit être >= 2")
-    rng = np.random.default_rng(seed)
-    theta_samples, eta_samples = sample_joint_prior(joint_prior, n_samples, rng=rng)
-    U = np.asarray(Parallel(n_jobs=N_JOBS)(delayed(G)(theta_samples[k], eta_samples[k]) for k in range(n_samples)))
-    m = U.shape[1]
-    Sinv = la.inv(Sigma_obs)
-    _, ldet = la.slogdet(Sigma_obs)
-    log_const = -0.5 * (ldet + m * np.log(2 * np.pi))
-    noise_mat = rng.multivariate_normal(np.zeros(m), Sigma_obs, size=n_samples)
-    Y = U + noise_mat
-    Y_M = Y @ Sinv
-    U_M = U @ Sinv
-    normY = np.einsum("ij,ij->i", Y, Y_M)
-    normU = np.einsum("ij,ij->i", U, U_M)
-    eig_estimate = 0.0
-    for i in range(0, n_samples, batch_size):
-        i_end = min(i + batch_size, n_samples)
-        batch_size_i = i_end - i
-        cross_batch = Y_M[i:i_end, :] @ U.T
-        normY_batch = normY[i:i_end]
-        quad_batch = normY_batch[:, None] + normU[None, :] - 2 * cross_batch
-        log_liks_batch = log_const - 0.5 * quad_batch
-        log_num_batch = log_liks_batch[np.arange(batch_size_i), i + np.arange(batch_size_i)]
-        log_den_batch = logsumexp_rows(log_liks_batch) - np.log(n_samples)
-        eig_estimate += (log_num_batch - log_den_batch).sum()
-    return eig_estimate / n_samples
+def compute_Sigma_noise(L_eta, H_eta, Sigma_eta_given_theta, Sigma_obs):
+    q  = Sigma_eta_given_theta.shape[0]
+    HS = H_eta @ Sigma_eta_given_theta
+    M  = Sigma_eta_given_theta - Sigma_eta_given_theta @ la.solve(np.eye(q) + HS, HS)
+    return np.asarray(Sigma_obs) + L_eta.T @ M @ L_eta
 
-# ============================================================
-# EIG bounds and selection
-# ============================================================
+
+def compute_Sigma_noise_misfit(L_eta, H_eta, Sigma_eta_given_theta, Sigma_obs):
+    eigvals, eigvects = la.eigh(np.asarray(Sigma_eta_given_theta))
+    eigvals = np.clip(eigvals, 1e-14, None)
+    Ssqrt = eigvects @ np.diag(np.sqrt(eigvals)) @ eigvects.T
+    H_m   = Ssqrt @ H_eta @ Ssqrt
+    A     = Ssqrt @ la.solve(np.eye(H_m.shape[0]) + H_m, Ssqrt)  # = (Sigma^{-1}+H)^{-1}
+    X     = A @ L_eta
+    return np.asarray(Sigma_obs) + L_eta.T @ X
+
+# =============================================================================
+# Gradient-free (régression linéaire)
+# =============================================================================
+
+def solve_linear_regression_theta_Y(G, joint_prior, Sigma_obs, n_samples=10000,
+                                     random_state=0, n_jobs=-1):
+    """Régresse X = G(theta,eta) sur Z = (theta, Y). Retourne A, b, M_emp, stats."""
+    rng = np.random.default_rng(random_state)
+    theta_s, eta_s = sample_joint_prior(joint_prior, n_samples, rng=rng)
+    X = np.asarray(Parallel(n_jobs=n_jobs)(
+        delayed(G)(theta_s[k], eta_s[k]) for k in range(n_samples)
+    ), dtype=float)
+    n, p = X.shape
+    Sigma_obs = np.asarray(Sigma_obs)
+    eps = rng.multivariate_normal(np.zeros(p), Sigma_obs, size=n)
+    Y   = X + eps
+    Z   = np.hstack([theta_s, Y])
+    mX  = X.mean(axis=0); mZ = Z.mean(axis=0)
+    Xc  = X - mX;         Zc = Z - mZ
+    SXZ = (Xc.T @ Zc) / n
+    SZZ = (Zc.T @ Zc) / n
+    A   = SXZ @ np.linalg.pinv(SZZ)
+    b   = mX - A @ mZ
+    R   = X - (Z @ A.T + b)
+    M   = (R.T @ R) / n
+    stats = {"m_X": mX, "m_Z": mZ, "X": X, "Y": Y, "Z": Z, "residuals": R}
+    return A, b, M, stats
+
+
+def solve_linear_matrix_regression_minimization(G, joint_prior, Sigma_obs,
+                                                 n_samples=10000, random_state=0):
+    """Résout min_{A,b} E[(X-AY-b)(...)^T]. Retourne A_star, b_star, M_emp, M_formula, stats."""
+    Sigma_obs = np.asarray(Sigma_obs)
+    rng = np.random.default_rng(random_state)
+    theta_s, eta_s = sample_joint_prior(joint_prior, n_samples, rng=rng)
+    X = np.asarray(Parallel(n_jobs=N_JOBS)(
+        delayed(G)(theta_s[k], eta_s[k]) for k in range(n_samples)
+    ), dtype=float)
+    n, p = X.shape
+    eps = rng.multivariate_normal(np.zeros(p), Sigma_obs, size=n)
+    Y   = X + eps
+    mX  = X.mean(axis=0); mY = Y.mean(axis=0)
+    Xc  = X - mX;         Yc = Y - mY
+    SXY = (Xc.T @ Yc) / n
+    SYY = (Yc.T @ Yc) / n
+    SX  = (Xc.T @ Xc) / n
+    A   = SXY @ np.linalg.inv(SYY)
+    b   = mX - A @ mY
+    R   = X - (Y @ A.T + b)
+    M_emp     = (R.T @ R) / n
+    M_formula = SX - SX @ np.linalg.inv(SX + Sigma_obs) @ SX
+    stats = {"m_X": mX, "m_Y": mY, "X": X, "Y": Y, "residuals": R}
+    return A, b, M_emp, M_formula, stats
+
+# =============================================================================
+# KLPrior + estimateur EIG KL
+# =============================================================================
+
+class KLPrior:
+    """Prior N(mu, Sigma) → représentation KL tronquée. xi ~ N(0, I_k)."""
+
+    def __init__(self, mu, Sigma, energy=0.99999):
+        self.mu_full = np.asarray(mu)
+        ev, V = la.eigh(np.asarray(Sigma))
+        ev = ev[::-1]; V = V[:, ::-1]
+        cumvar = np.cumsum(ev) / ev.sum()
+        self.k        = int(np.searchsorted(cumvar, energy)) + 1
+        self.V_k      = V[:, :self.k]
+        self.lam_k    = ev[:self.k]
+        self.sqrt_lam = np.sqrt(self.lam_k)
+        self.mu    = np.zeros(self.k)
+        self.Sigma = np.eye(self.k)
+        print(f"    KL tronquée : {self.k} modes, {cumvar[self.k-1]*100:.3f}% variance")
+
+    def xi_to_z(self, xi):
+        return self.mu_full + self.V_k @ (self.sqrt_lam * xi)
+
+    def make_G_reduced(self, G_1arg):
+        return lambda xi: G_1arg(self.xi_to_z(xi))
+
+    def make_J_reduced(self, J_G_1arg):
+        def J_r(xi):
+            z = self.xi_to_z(xi)
+            J = np.asarray(J_G_1arg(z))        # (m, d)
+            return J @ self.V_k @ np.diag(self.sqrt_lam)  # (m, k)
+        return J_r
+
+
+def estimate_eig_kl(G_j, J_G_j, kl_prior, Sigma_obs, n_outer, seed=None, n_jobs=-1):
+    """Estimateur KL de l'EIG. Sigma_obs est le bruit effectif (Sigma_Y_given_theta en GO)."""
+    G_r = kl_prior.make_G_reduced(G_j)
+    J_r = kl_prior.make_J_reduced(J_G_j)
+    k   = kl_prior.k
+    m   = len(Sigma_obs)
+
+    Sigma_obs = np.asarray(Sigma_obs, dtype=float)
+    L_obs    = sla.cholesky(Sigma_obs, lower=True)
+    Sinv_obs = sla.cho_solve((L_obs, True), np.eye(m))
+    _, ld    = la.slogdet(Sigma_obs)
+    log_c    = -0.5 * (ld + m * np.log(2*np.pi))
+
+    ss    = np.random.SeedSequence(seed)
+    seeds = ss.spawn(n_outer)
+
+    def _step(seed_i):
+        rng = np.random.default_rng(seed_i)
+        xi  = rng.standard_normal(k)
+        Gr  = np.asarray(G_r(xi))
+        Jr  = np.asarray(J_r(xi))              # (m, k)
+        S      = Jr @ Jr.T + Sigma_obs
+        L_S    = sla.cholesky(S, lower=True)
+        Sinv_S = sla.cho_solve((L_S, True), np.eye(m))
+        _, ld_S = la.slogdet(S)
+        log_c_S = -0.5 * (ld_S + m * np.log(2*np.pi))
+        bias_corr = 0.5 * (np.trace(Sinv_S @ Sigma_obs) - m)
+        eps    = rng.multivariate_normal(np.zeros(m), Sigma_obs)
+        y      = Gr + eps
+        log_lik = log_c - 0.5 * np.dot(eps, Sinv_obs @ eps)
+        r       = y - Gr
+        log_py  = log_c_S - 0.5 * r @ Sinv_S @ r
+        return float(log_lik - log_py - bias_corr)
+
+    results = Parallel(n_jobs=n_jobs)(delayed(_step)(seeds[i]) for i in range(n_outer))
+    return float(np.mean(results))
+
+# =============================================================================
+# Bornes EIG
+# =============================================================================
 
 def _log_ratio(A, B, M):
     _, la_ = la.slogdet(M.T @ A @ M)
@@ -287,385 +408,295 @@ def _log_ratio(A, B, M):
     return 0.5 * (la_ - lb_)
 
 
-def eig_BI(Sigma_Y, Sigma_noise, W):
+def eig_LB(Sigma_Y, Sigma_noise, W):
+    """Borne inférieure BI : log|W^T Sigma_Y W| / |W^T Sigma_noise W| (relatif au plein)."""
     eye = np.eye(Sigma_noise.shape[0])
     return _log_ratio(Sigma_Y, Sigma_noise, W) - _log_ratio(Sigma_Y, Sigma_noise, eye)
 
 
-def eig_BS(Sigma_signal, Sigma_obs, W):
-    eye = np.eye(Sigma_obs.shape[0])
-    return _log_ratio(Sigma_signal, Sigma_obs, W) - _log_ratio(Sigma_signal, Sigma_obs, eye)
+def eig_UB(Sigma_signal, Sigma_Y_given_theta, W):
+    """Borne supérieure BS : log|W^T Sigma_signal W| / |W^T Sigma_Y_given_theta W| (relatif)."""
+    eye = np.eye(Sigma_Y_given_theta.shape[0])
+    return _log_ratio(Sigma_signal, Sigma_Y_given_theta, W) - _log_ratio(Sigma_signal, Sigma_Y_given_theta, eye)
 
 
 def greedy_maximize_LB(Sigma_Y, Sigma_noise, n_sensors):
-    N_grid = Sigma_Y.shape[0]
-    selected = []
-    remaining = list(range(N_grid))
+    Sigma_Y     = 0.5*(Sigma_Y     + Sigma_Y.T)
+    Sigma_noise = 0.5*(Sigma_noise + Sigma_noise.T)
+    N_g = Sigma_Y.shape[0]
+    selected = []; remaining = set(range(N_g))
+
     for _ in range(n_sensors):
-        best_idx, best_score = None, -np.inf
+        best_idx, best_sc = None, -np.inf
         for idx in remaining:
-            S = selected + [idx]
-            ix = np.ix_(S, S)
-            sign_y, logdet_y = np.linalg.slogdet(Sigma_Y[ix])
-            sign_n, logdet_n = np.linalg.slogdet(Sigma_noise[ix])
-            if sign_y <= 0 or sign_n <= 0:
+            S = selected + [idx]; ix = np.ix_(S, S)
+            sy, ldy = la.slogdet(Sigma_Y[ix])
+            sn, ldn = la.slogdet(Sigma_noise[ix])
+            if sy <= 0 or sn <= 0:
                 continue
-            score = 0.5 * (logdet_y - logdet_n)
-            if score > best_score:
-                best_score, best_idx = score, idx
-        selected.append(best_idx)
-        remaining.remove(best_idx)
-    return np.asarray(selected, dtype=int)
-
-
-def schur(Sigma, Wm):
-    if Wm.size == 0:
-        return Sigma
-    G = Wm.T @ Sigma @ Wm
-    return Sigma - Sigma @ Wm @ np.linalg.inv(G) @ Wm.T @ Sigma
-
-
-def incremental_bounds(Sigma_signal, Sigma_Y_theta, Sigma_Y, Sigma_noise, n_sensors):
-    N_grid = Sigma_Y.shape[0]
-    candidates = [np.eye(N_grid)[:, i] for i in range(N_grid)]
-    selected, remaining = [], list(range(N_grid))
-    scores_lb, scores_ub = [], []
-    eig_lb = eig_ub = 0.0
-    for _ in range(n_sensors):
-        Wm = np.column_stack([candidates[i] for i in selected]) if selected else np.empty((N_grid, 0))
-        Ss = schur(Sigma_signal,  Wm)
-        Syt = schur(Sigma_Y_theta, Wm)
-        SY = schur(Sigma_Y,       Wm)
-        Sn = schur(Sigma_noise,   Wm)
-        best_idx, best_lb, best_ub = None, -np.inf, None
-        for idx in remaining:
-            w = candidates[idx]
-            n_lb = float(w @ Ss @ w)
-            d_lb = float(w @ Syt @ w)
-            n_ub = float(w @ SY @ w)
-            d_ub = float(w @ Sn @ w)
-            if min(n_lb, d_lb, n_ub, d_ub) <= 0:
-                continue
-            dlb = 0.5 * np.log(n_lb / d_lb)
-            dub = 0.5 * np.log(n_ub / d_ub)
-            if dlb > best_lb:
-                best_lb, best_ub, best_idx = dlb, dub, idx
+            sc = 0.5*(ldy - ldn)
+            if sc > best_sc:
+                best_sc, best_idx = sc, idx
         if best_idx is None:
+            warnings.warn("greedy_maximize_LB : aucun capteur SPD trouvé.", RuntimeWarning, stacklevel=2)
             break
-        selected.append(best_idx)
-        remaining.remove(best_idx)
-        eig_lb += best_lb
-        eig_ub += best_ub
-        scores_lb.append(eig_lb)
-        scores_ub.append(eig_ub)
-    return np.asarray(selected, dtype=int), scores_lb, scores_ub
+        selected.append(best_idx); remaining.remove(best_idx)
+    return np.array(selected, dtype=int)
 
 
-def incremental_bounds_given_W(Sigma_signal, Sigma_Y_theta, Sigma_Y, Sigma_noise, W):
-    _, ls = np.linalg.slogdet(W.T @ Sigma_signal @ W)
-    _, lt = np.linalg.slogdet(W.T @ Sigma_Y_theta @ W)
-    _, ly = np.linalg.slogdet(W.T @ Sigma_Y @ W)
-    _, ln = np.linalg.slogdet(W.T @ Sigma_noise @ W)
-    return 0.5 * (ls - lt), 0.5 * (ly - ln)
+def incremental_bounds(Sigma_signal, Sigma_Y_given_theta, Sigma_Y, Sigma_noise, n_sensors):
+    """Sélection gloutonne par bornes incrémentales (Schur rang-1, O(N²) par étape).
 
-# ============================================================
-# Modèle GO / prior
-# ============================================================
+    LB increment : ½ log [Σ_signal(Wm)]_ii / [Σ_{Y|θ}(Wm)]_ii
+    UB increment : ½ log [Σ_Y(Wm)]_ii     / [Σ_noise(Wm)]_ii
+    """
+    N_loc = Sigma_Y.shape[0]
+    Ss    = Sigma_signal.copy();  Syth = Sigma_Y_given_theta.copy()
+    SY    = Sigma_Y.copy();       Sn   = Sigma_noise.copy()
+    selected: list[int] = []; remaining: list[int] = list(range(N_loc))
+    scores_inf: list[float] = []; scores_sup: list[float] = []
+    eig_inf = eig_sup = 0.0
 
-def make_forward_model(pde_model, n_steps):
-    def G(theta, eta):
-        u0 = np.concatenate((theta, eta), axis=None)
-        return pde_model.evolve(u0=u0, n_steps=n_steps)[-1, :]
-    return G
+    for _ in range(n_sensors):
+        best_idx = None; best_dinf = -np.inf; best_dsup = None
+        for idx in remaining:
+            ni = Ss[idx,idx]; di = Syth[idx,idx]
+            nu = SY[idx,idx]; du = Sn[idx,idx]
+            if min(ni, di, nu, du) <= 1e-14:
+                warnings.warn(f"Variance quasi-nulle capteur {idx} — ignoré.",
+                              RuntimeWarning, stacklevel=2)
+                continue
+            dinf = 0.5*np.log(ni/di); dsup = 0.5*np.log(nu/du)
+            if dinf > best_dinf:
+                best_dinf, best_dsup, best_idx = dinf, dsup, idx
+        if best_idx is None:
+            warnings.warn("Aucun capteur valide — arrêt prématuré.", RuntimeWarning, stacklevel=2)
+            break
+        for S in (Ss, Syth, SY, Sn):
+            col = S[:, best_idx].copy()
+            S  -= np.outer(col, col) / S[best_idx, best_idx]
+        selected.append(best_idx); remaining.remove(best_idx)
+        eig_inf += best_dinf; eig_sup += best_dsup
+        scores_inf.append(eig_inf); scores_sup.append(eig_sup)
 
-
-def build_objects(lambda_):
-    model = Burgers_CN(N=N, dt=DT, diffusivity=DIFFUSIVITY, lambda_=lambda_)
-    kernel = Matern32(length_scale=KERNEL_LS, sigma=KERNEL_SIG)
-    try:
-        prior = GaussianProcessPrior(kernel, mu=np.zeros(N), nx=N)
-    except TypeError:
-        prior = GaussianProcessPrior(kernel, nx=N)
-        prior.mu = np.zeros(N)
-    # jitter for numerical stability
-    eigvals = np.linalg.eigvalsh(prior.Sigma)
-    prior.Sigma += eigvals[-1] / 1000.0
-    d = q = N // 2
-    joint_prior = {
-        "mu": prior.mu,
-        "Sigma": prior.Sigma,
-        "d": d,
-        "q": q,
+    return {
+        "indices":         np.array(selected, dtype=int),
+        "scores_inf":      scores_inf,
+        "scores_sup":      scores_sup,
+        "EIG_lower_bound": eig_inf,
+        "EIG_upper_bound": eig_sup,
     }
-    noise = NoiseModel(sigma_noise=SIGMA)
-    Sigma_obs = noise.get_covariance(N)
-    G = make_forward_model(model, n_steps=N_STEPS)
-    return prior, joint_prior, Sigma_obs, G
 
-# ============================================================
+
+def incremental_bounds_given_W(Sigma_signal, Sigma_Y_given_theta, Sigma_Y, Sigma_noise, W):
+    _, ls = la.slogdet(W.T @ Sigma_signal       @ W)
+    _, lt = la.slogdet(W.T @ Sigma_Y_given_theta @ W)
+    _, ly = la.slogdet(W.T @ Sigma_Y             @ W)
+    _, ln = la.slogdet(W.T @ Sigma_noise          @ W)
+    return 0.5*(ls - lt), 0.5*(ly - ln)
+
+# =============================================================================
+# Helper bornes pour un jeu de matrices
+# =============================================================================
+
+def _bounds_for_W(Ss, Sn, Sigma_Y, SYth, budgets, method):
+    """
+    Ss  : Sigma_signal_misfit  (numérateur signal, préconditionné par Sigma_prior)
+    Sn  : Sigma_noise_misfit   (dénominateur bruit, préconditionné par Sigma_eta|theta)
+    SYth: Sigma_Y_given_theta  (dénominateur fixe de eig_UB et eig_UB incrémental)
+
+    Retourne (cons_lb, cons_ub, inc_lb, inc_ub), listes de longueur len(budgets).
+      cons_lb / cons_ub : eig_LB / eig_UB sur le W sélectionné (greedy ou incrémental)
+      inc_lb  / inc_ub  : bornes incrémentales cumulées
+    """
+    cons_lb, cons_ub, inc_lb, inc_ub = [], [], [], []
+    max_b = max(budgets)
+
+    if method == "cons":
+        indices = greedy_maximize_LB(Sigma_Y, Sn, max_b)
+        for budget in budgets:
+            W, _ = build_selection_matrices(N, indices[:budget])
+            cons_lb.append(eig_LB(Sigma_Y, Sn, W))
+            cons_ub.append(eig_UB(Ss, SYth, W))
+            lb, ub = incremental_bounds_given_W(Ss, SYth, Sigma_Y, Sn, W)
+            inc_lb.append(lb); inc_ub.append(ub)
+
+    elif method == "inc":
+        for budget in budgets:
+            res  = incremental_bounds(Ss, SYth, Sigma_Y, Sn, budget)
+            W, _ = build_selection_matrices(N, res["indices"])
+            cons_lb.append(eig_LB(Sigma_Y, Sn, W))
+            cons_ub.append(eig_UB(Ss, SYth, W))
+            inc_lb.append(res["EIG_lower_bound"])
+            inc_ub.append(res["EIG_upper_bound"])
+
+    return cons_lb, cons_ub, inc_lb, inc_ub
+
+# =============================================================================
 # Une répétition
-# ============================================================
+# =============================================================================
 
-def run_one_repeat(lambda_, seed, eig_offset):
+def run_one_repeat(lambda_, seed, eig_offset, Sigma_Y_given_theta,
+                   Sigma_signal_free, Sigma_noise_free):
     prior, joint_prior, Sigma_obs, G = build_objects(lambda_)
+
+    d = joint_prior["d"]
+    Sigma_theta        = prior.Sigma[:d, :d]
+    Sigma_eta          = prior.Sigma[d:, d:]
+    Sigma_et           = prior.Sigma[d:, :d]
+    Sigma_eta_given_theta = Sigma_eta - Sigma_et @ la.solve(Sigma_theta, Sigma_et.T)
+    Sigma_eta_given_theta = 0.5*(Sigma_eta_given_theta + Sigma_eta_given_theta.T)
+    Sigma_eta_given_theta += 1e-12 * np.eye(joint_prior["q"])
+
     rng = np.random.default_rng(seed)
-    l_theta = estimate_E_JT(G, joint_prior, N_SAMPLES, rng=rng)["EJ_full_T"]
-    H_theta = estimate_jacobian_covariances_mc(
-        G=G,
-        joint_prior=joint_prior,
-        Sigma_obs=Sigma_obs,
-        n_samples=N_SAMPLES,
-        rng=rng,
-        n_jobs=N_JOBS,
-    )["Cov_full"]
+    res_l   = estimate_E_JT(G, joint_prior, N_SAMPLES, rng=rng)
+    res_H   = estimate_jacobian_covariances_mc(G, joint_prior, Sigma_obs, N_SAMPLES, rng=rng)
     Sigma_Y = estimate_Sigma_Y(G, joint_prior, Sigma_obs, N_SAMPLES_SIGMA_Y, rng=rng)
-    Sigma_Y_theta = estimate_E_cov_Y_given_theta(
-        G=G,
-        joint_prior=joint_prior,
-        Sigma_obs=Sigma_obs,
-        n_theta=N_SAMPLES_Y_GIVEN_THETA,
-        n_eta=N_ETA_INNER,
-        rng=rng,
-        n_jobs=N_JOBS,
-    )
-    Sigma_signal = compute_Sigma_signal(l_theta, H_theta, prior.Sigma, Sigma_obs)
-    max_budget = max(SENSOR_BUDGETS)
-    indices_inc, scores_lb, scores_ub = incremental_bounds(
-        Sigma_signal, Sigma_Y_theta, Sigma_Y, Sigma_obs, max_budget
-    )
-    inc_results = {"cons_lb": [], "cons_ub": [], "inc_lb": [], "inc_ub": []}
-    for budget in SENSOR_BUDGETS:
-        W, _ = build_selection_matrices(N, indices_inc[:budget])
-        inc_results["cons_lb"].append(eig_BI(Sigma_Y, Sigma_obs, W) + eig_offset)
-        inc_results["cons_ub"].append(eig_BS(Sigma_signal, Sigma_obs, W) + eig_offset)
-        inc_results["inc_lb"].append(scores_lb[budget - 1])
-        inc_results["inc_ub"].append(scores_ub[budget - 1])
-    indices_cons = greedy_maximize_LB(Sigma_Y, Sigma_obs, max_budget)
-    cons_results = {"cons_lb": [], "cons_ub": [], "inc_lb": [], "inc_ub": []}
-    for budget in SENSOR_BUDGETS:
-        W, _ = build_selection_matrices(N, indices_cons[:budget])
-        cons_results["cons_lb"].append(eig_BI(Sigma_Y, Sigma_obs, W) + eig_offset)
-        cons_results["cons_ub"].append(eig_BS(Sigma_signal, Sigma_obs, W) + eig_offset)
-        lb_inc, ub_inc = incremental_bounds_given_W(
-            Sigma_signal, Sigma_Y_theta, Sigma_Y, Sigma_obs, W
+
+    l_full = res_l["EJ_full_T"]; H_full = res_H["Cov_full"]
+    l_eta  = res_l["EJ_eta_T"];  H_eta  = res_H["Cov_eta"]
+
+    # Variante misfit : préconditionné par Sigma_prior / Sigma_eta|theta
+    # Capte les directions de maximum d'information (VP de H_m = Sigma^{1/2} H Sigma^{1/2})
+    Sigma_signal_misfit = compute_Sigma_signal_misfit(l_full, H_full, prior.Sigma, Sigma_obs)
+    Sigma_noise_misfit  = compute_Sigma_noise_misfit(l_eta, H_eta, Sigma_eta_given_theta, Sigma_obs)
+
+    result = {}
+    for method in ("cons", "inc"):
+        # Variante fd : jacobiens par différences finies, matrices misfit
+        clb, cub, ilb, iub = _bounds_for_W(
+            Sigma_signal_misfit, Sigma_noise_misfit,
+            Sigma_Y, Sigma_Y_given_theta, SENSOR_BUDGETS, method,
         )
-        cons_results["inc_lb"].append(lb_inc)
-        cons_results["inc_ub"].append(ub_inc)
-    return inc_results, cons_results
+        result[f"{method}_fd_lb"]     = [v + eig_offset for v in clb]
+        result[f"{method}_fd_ub"]     = [v + eig_offset for v in cub]
+        result[f"{method}_fd_inc_lb"] = ilb
+        result[f"{method}_fd_inc_ub"] = iub
 
-# ============================================================
-# Plotting
-# ============================================================
-
-BOUND_STYLES = {
-    "cons_lb": dict(color="tab:blue",   marker="o", linestyle="--", label="Conservative LB"),
-    "cons_ub": dict(color="tab:cyan",   marker="s", linestyle="--", label="Conservative UB"),
-    "inc_lb":  dict(color="tab:orange", marker="o", linestyle="-",  label="Incremental LB"),
-    "inc_ub":  dict(color="tab:red",    marker="s", linestyle="-",  label="Incremental UB"),
-}
-
-
-def _fill_common_region(ax, positions, lb_common, ub_common, mask):
-    from matplotlib.patches import Patch
-    label = "Common certified region"
-    handle = Patch(
-        facecolor="tab:green",
-        edgecolor="tab:green",
-        alpha=0.38,
-        hatch="//",
-        label=label,
-    )
-    positions = np.asarray(positions, dtype=float)
-    lb_common = np.asarray(lb_common, dtype=float)
-    ub_common = np.asarray(ub_common, dtype=float)
-    mask = np.asarray(mask, dtype=bool)
-    if len(positions) == 1:
-        if mask[0]:
-            width = 0.35
-            ax.fill_between(
-                [positions[0] - width, positions[0] + width],
-                [lb_common[0], lb_common[0]],
-                [ub_common[0], ub_common[0]],
-                facecolor="tab:green",
-                edgecolor="tab:green",
-                linewidth=0.0,
-                alpha=0.38,
-                hatch="//",
-                zorder=1,
-            )
-        return handle
-    half_width = 0.35 * float(np.min(np.diff(positions)))
-    for idx, is_valid in enumerate(mask):
-        if not is_valid:
-            continue
-        ax.fill_between(
-            [positions[idx] - half_width, positions[idx] + half_width],
-            [lb_common[idx], lb_common[idx]],
-            [ub_common[idx], ub_common[idx]],
-            facecolor="tab:green",
-            edgecolor="tab:green",
-            linewidth=0.0,
-            alpha=0.38,
-            hatch="//",
-            zorder=1,
+        # Variante free : gradient-free (régression), matrices misfit approchées sans jacobiens
+        clb, cub, ilb, iub = _bounds_for_W(
+            Sigma_signal_free, Sigma_noise_free,
+            Sigma_Y, Sigma_Y_given_theta, SENSOR_BUDGETS, method,
         )
-    for idx in range(len(positions) - 1):
-        if not (mask[idx] and mask[idx + 1]):
-            continue
-        ax.fill_between(
-            positions[idx : idx + 2],
-            lb_common[idx : idx + 2],
-            ub_common[idx : idx + 2],
-            facecolor="tab:green",
-            edgecolor="tab:green",
-            linewidth=0.0,
-            alpha=0.38,
-            hatch="//",
-            zorder=1,
-        )
-    return handle
+        result[f"{method}_free_lb"]     = [v + eig_offset for v in clb]
+        result[f"{method}_free_ub"]     = [v + eig_offset for v in cub]
+        result[f"{method}_free_inc_lb"] = ilb
+        result[f"{method}_free_inc_ub"] = iub
 
+    return result
 
-def _draw_boxplot_subplot(ax, all_repeats, lambda_, budgets):
-    positions = np.asarray(budgets, dtype=float)
-    step = float(np.min(np.diff(positions))) if len(positions) > 1 else 1.0
-    offsets = {
-        "cons_lb": -0.30 * step,
-        "cons_ub": -0.10 * step,
-        "inc_lb":   0.10 * step,
-        "inc_ub":   0.30 * step,
-    }
-    box_width = 0.14 * step
-    legend_handles = []
-    data_by_key = {}
-    medians_by_key = {}
-    for key in BOUND_STYLES:
-        data = [[rep[key][b_idx] for rep in all_repeats] for b_idx in range(len(budgets))]
-        data_by_key[key] = data
-        medians_by_key[key] = np.asarray([float(np.median(d)) for d in data])
-    cons_gap = ax.fill_between(
-        positions,
-        medians_by_key["cons_lb"],
-        medians_by_key["cons_ub"],
-        color="tab:blue",
-        alpha=0.14,
-        label="Conservative gap",
-        zorder=0,
-    )
-    inc_gap = ax.fill_between(
-        positions,
-        medians_by_key["inc_lb"],
-        medians_by_key["inc_ub"],
-        color="tab:orange",
-        alpha=0.16,
-        label="Incremental gap",
-        zorder=0,
-    )
-    lb_common = np.maximum(medians_by_key["cons_lb"], medians_by_key["inc_lb"])
-    ub_common = np.minimum(medians_by_key["cons_ub"], medians_by_key["inc_ub"])
-    common_mask = lb_common <= ub_common
-    common_region = _fill_common_region(ax, positions, lb_common, ub_common, common_mask)
-    for key, style in BOUND_STYLES.items():
-        data = data_by_key[key]
-        color = style["color"]
-        bp = ax.boxplot(
-            data,
-            positions=positions + offsets[key],
-            widths=box_width,
-            patch_artist=True,
-            showfliers=False,
-            manage_ticks=False,
-            boxprops=dict(color=color),
-            whiskerprops=dict(color=color),
-            capprops=dict(color=color),
-            medianprops=dict(color=color, linewidth=1.6),
-        )
-        for patch in bp["boxes"]:
-            patch.set_facecolor(color)
-            patch.set_alpha(0.22)
-        ax.plot(
-            positions + offsets[key], medians_by_key[key],
-            color=color, marker=style["marker"],
-            linestyle=style["linestyle"], linewidth=1.6,
-            zorder=3,
-        )
-        from matplotlib.lines import Line2D
-        legend_handles.append(Line2D(
-            [0], [0], color=color, marker=style["marker"],
-            linestyle=style["linestyle"], linewidth=1.6,
-            label=style["label"],
-        ))
-    legend_handles.extend([cons_gap, inc_gap, common_region])
-    ax.set_title(f"λ = {lambda_}", fontsize=11)
-    ax.set_xlabel("Number of sensors")
-    ax.set_ylabel("Information gain")
-    ax.set_xticks(budgets)
-    ax.grid(True, which="both", linestyle=":", linewidth=0.8)
-    ax.legend(handles=legend_handles, frameon=False, fontsize=8)
-
-
-def make_figure(results_by_lambda, selection_method, output_path):
-    lambdas = list(results_by_lambda.keys())
-    n = len(lambdas)
-    n_cols = min(2, n)
-    n_rows = int(np.ceil(n / n_cols))
-    fig, axes = plt.subplots(
-        n_rows, n_cols,
-        figsize=(7 * n_cols, 5 * n_rows),
-        squeeze=False,
-        sharey=True,
-    )
-    axes = axes.ravel()
-    for ax, lam in zip(axes, lambdas):
-        _draw_boxplot_subplot(ax, results_by_lambda[lam], lam, SENSOR_BUDGETS)
-    for ax in axes[len(lambdas):]:
-        ax.axis("off")
-    fig.suptitle(f"GO EIG bounds — {selection_method} selection  ({N_REPEATS} repeats)", fontsize=13)
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=180)
-    plt.close(fig)
-    print(f"  Saved: {output_path}")
-
-# ============================================================
+# =============================================================================
 # Main
-# ============================================================
+# =============================================================================
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    inc_by_lambda = {}
-    cons_by_lambda = {}
+
     for lam in LAMBDAS:
-        print(f"\n=== lambda = {lam} ===")
+        print(f"\n{'='*60}\n  lambda = {lam}\n{'='*60}")
+
         prior, joint_prior, Sigma_obs, G = build_objects(lam)
-        print(f"  Estimating eig_mem (n={N_SAMPLES_EIG})...")
-        eig_offset = estimate_eig_memory_efficient(
-            G=G,
-            joint_prior=joint_prior,
-            Sigma_obs=Sigma_obs,
-            n_samples=N_SAMPLES_EIG,
-            batch_size=500,
-            seed=BASE_SEED,
+        d = joint_prior["d"]
+
+        # ------------------------------------------------------------------
+        # 1. Sigma_Y_given_theta  (MC imbriqué, une fois)
+        # ------------------------------------------------------------------
+        print("  [1/4] Sigma_Y_given_theta (MC imbriqué)...")
+        Sigma_Y_given_theta = estimate_E_cov_Y_given_theta(
+            G, joint_prior, Sigma_obs, n_theta=N_THETA_YTH, n_eta=N_ETA_INNER,
+            rng=np.random.default_rng(BASE_SEED), n_jobs=N_JOBS,
         )
-        print(f"  eig_mem = {eig_offset:.4f}")
-        seeds = [BASE_SEED + 1000 * LAMBDAS.index(lam) + r for r in range(N_REPEATS)]
-        print(f"  Running {N_REPEATS} repeats...")
-        repeat_outputs = Parallel(n_jobs=N_JOBS)(
-            delayed(run_one_repeat)(lam, s, eig_offset) for s in seeds
+
+        # ------------------------------------------------------------------
+        # 2. EIG offset — KL sur theta, bruit = Sigma_Y_given_theta
+        # ------------------------------------------------------------------
+        print("  [2/4] EIG offset (KL)...")
+        theta_prior_mu    = joint_prior["mu"][:d]
+        theta_prior_Sigma = joint_prior["Sigma"][:d, :d]
+        mu_eta            = joint_prior["mu"][d:]
+        Sigma_eta_theta   = joint_prior["Sigma"][d:, :d]  # Cov(eta, theta)
+        A_cond = la.solve(theta_prior_Sigma, Sigma_eta_theta.T).T   # E[eta|theta]
+
+        kl_prior_theta = KLPrior(theta_prior_mu, theta_prior_Sigma)
+
+        def G_eff(theta):
+            return G(theta, mu_eta + A_cond @ (theta - theta_prior_mu))
+
+        def J_G_eff(theta):
+            eta_c = mu_eta + A_cond @ (theta - theta_prior_mu)
+            Jt = jacobian_fd_theta(G, theta, eta_c)   # (m, d)
+            Je = jacobian_fd_eta(G,  theta, eta_c)    # (m, q)
+            return Jt + Je @ A_cond                    # (m, d)
+
+        eig_offset = estimate_eig_kl(
+            G_eff, J_G_eff, kl_prior_theta,
+            Sigma_Y_given_theta, N_SAMPLES_EIG,
+            seed=BASE_SEED, n_jobs=N_JOBS,
         )
-        inc_by_lambda[lam] = [out[0] for out in repeat_outputs]
-        cons_by_lambda[lam] = [out[1] for out in repeat_outputs]
-    print("\nGenerating figures...")
-    make_figure(
-        inc_by_lambda,
-        selection_method="incremental",
-        output_path=OUTPUT_DIR / "bounds_incremental_selection_GO.png",
-    )
-    make_figure(
-        cons_by_lambda,
-        selection_method="conservative",
-        output_path=OUTPUT_DIR / "bounds_conservative_selection_GO.png",
-    )
-    print("Done.")
+        print(f"    eig_offset (KL) = {eig_offset:.4f}")
+
+        # ------------------------------------------------------------------
+        # 3. Sigma_noise_free  (régression (theta,Y) → G)
+        # ------------------------------------------------------------------
+        print("  [3/4] Sigma_noise_free (régression theta,Y → G)...")
+        _, _, M_noise, _ = solve_linear_regression_theta_Y(
+            G, joint_prior, Sigma_obs,
+            n_samples=N_SAMPLES_FREE, random_state=BASE_SEED + 1,
+        )
+        Sobs_inv = la.inv(np.asarray(Sigma_obs))
+        EIytheta = Sobs_inv @ (np.eye(N) - M_noise @ Sobs_inv)
+        Sigma_noise_free = la.inv(EIytheta)
+        Sigma_noise_free = 0.5*(Sigma_noise_free + Sigma_noise_free.T)
+
+        # ------------------------------------------------------------------
+        # 4. Sigma_signal_free  (régression Y → G)
+        # ------------------------------------------------------------------
+        print("  [4/4] Sigma_signal_free (régression Y → G)...")
+        _, _, _, M_formula, _ = solve_linear_matrix_regression_minimization(
+            G, joint_prior, Sigma_obs,
+            n_samples=N_SAMPLES_FREE, random_state=BASE_SEED + 2,
+        )
+        Iy = Sobs_inv @ (np.eye(N) - M_formula @ Sobs_inv)
+        Sigma_signal_free = la.inv(Iy)
+        Sigma_signal_free = 0.5*(Sigma_signal_free + Sigma_signal_free.T)
+
+        # ------------------------------------------------------------------
+        # 5. Répétitions
+        # ------------------------------------------------------------------
+        print(f"  Repeats (n={N_REPEATS})...")
+        seeds = [BASE_SEED + 1000*LAMBDAS.index(lam) + r for r in range(N_REPEATS)]
+        repeat_results = Parallel(n_jobs=N_JOBS)(
+            delayed(run_one_repeat)(
+                lam, s, eig_offset,
+                Sigma_Y_given_theta, Sigma_signal_free, Sigma_noise_free,
+            )
+            for s in seeds
+        )
+
+        # ------------------------------------------------------------------
+        # 6. Sauvegarde .npz
+        # ------------------------------------------------------------------
+        keys = [
+            "cons_fd_lb",   "cons_fd_ub",   "cons_fd_inc_lb",   "cons_fd_inc_ub",
+            "cons_free_lb", "cons_free_ub", "cons_free_inc_lb", "cons_free_inc_ub",
+            "inc_fd_lb",    "inc_fd_ub",    "inc_fd_inc_lb",    "inc_fd_inc_ub",
+            "inc_free_lb",  "inc_free_ub",  "inc_free_inc_lb",  "inc_free_inc_ub",
+        ]
+        arrays = {k: np.array([r[k] for r in repeat_results]) for k in keys}
+
+        fname = OUTPUT_DIR / f"results_GO_lambda_{lam:.2f}.npz"
+        np.savez(
+            fname,
+            eig_offset     = np.float64(eig_offset),
+            sensor_budgets = np.array(SENSOR_BUDGETS),
+            lambda_val     = np.float64(lam),
+            n_repeats      = np.int64(N_REPEATS),
+            **arrays,
+        )
+        print(f"  Sauvegardé : {fname}")
+
+    print("\nDone.")
+
 
 if __name__ == "__main__":
     main()
